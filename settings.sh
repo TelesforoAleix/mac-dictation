@@ -185,4 +185,5 @@ SWIFT
 if [[ "$verify" == apply ]]; then
     open /Applications/VoiceInk.app
     printf 'Manual step: enable Launch at Login in VoiceInk Settings > General.\n'
+    printf 'After granting Microphone or Accessibility (including after rebuilds), quit and reopen VoiceInk so Fn works.\n'
 fi

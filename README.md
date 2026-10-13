@@ -44,7 +44,7 @@ The encoded mode and shortcut formats are taken from the default upstream commit
 
 ## Permissions and manual steps
 
-Launch `/Applications/VoiceInk.app` and grant Microphone and Accessibility to that app in System Settings → Privacy & Security. Remove stale entries for the old Downloads copy if shown. An ad hoc rebuild may require these permissions again. Finish or skip onboarding without enabling a cloud provider or Screen Recording, and rerun `settings.sh` if onboarding changes a decided setting.
+Launch `/Applications/VoiceInk.app` and grant Microphone and Accessibility to that app in System Settings → Privacy & Security. Remove stale entries for the old Downloads copy if shown. An ad hoc rebuild may require these permissions again. **After granting permissions, quit and reopen VoiceInk**, including after a rebuild that asks for permissions again. If VoiceInk was launched before Accessibility was granted, Fn may do nothing until the app is reopened: upstream creates its shortcut event tap at launch and does not retry it. Finish or skip onboarding without enabling a cloud provider or Screen Recording, and rerun `settings.sh` if onboarding changes a decided setting.
 
 Enable **Launch at Login** in VoiceInk Settings → General. Upstream implements this through `SMAppService.mainApp` registration, not a preferences key, so the script cannot enable it with `defaults write`. Approve it in macOS Login Items if macOS requests that.
 
