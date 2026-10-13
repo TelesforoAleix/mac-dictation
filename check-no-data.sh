@@ -2,6 +2,8 @@
 set -euo pipefail
 
 failed=0
+# Fail even when the caller is outside a Git repository (process substitution hides errors).
+git rev-parse --is-inside-work-tree >/dev/null
 while IFS= read -r -d '' path; do
     lower=$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')
     case "$lower" in
