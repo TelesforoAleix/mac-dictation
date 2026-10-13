@@ -1,0 +1,15 @@
+.upstream/
+.build-cache/
+*.wav
+*.m4a
+*.mp3
+*.caf
+*.json
+*.csv
+*.plist
+*.store*
+*.sqlite*
+*.bin
+*.gguf
+*.mlmodelc/
+.DS_Store
