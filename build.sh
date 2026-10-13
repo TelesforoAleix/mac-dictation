@@ -8,7 +8,9 @@ os_version=$(sw_vers -productVersion)
 xcode_version=$(xcodebuild -version | awk '/^Xcode / {print $2}')
 [[ -n "$xcode_version" ]] || die 'Requires full Xcode 27.0 or later.'
 (( ${xcode_version%%.*} >= 27 )) || die 'Requires Xcode 27.0 or later.'
-xcrun --find metal >/dev/null
+xcodebuild -checkFirstLaunchStatus >/dev/null 2>&1 || die 'Complete Xcode setup: sudo xcodebuild -runFirstLaunch'
+metal_component=$(xcodebuild -showComponent MetalToolchain 2>/dev/null) || die 'Install Metal Toolchain: xcodebuild -downloadComponent MetalToolchain'
+printf '%s\n' "$metal_component" | /usr/bin/grep -Eq '^Status: installed[[:space:]]*$' || die 'Install Metal Toolchain: xcodebuild -downloadComponent MetalToolchain'
 (( $# <= 1 )) || die 'Usage: ./build.sh [upstream-commit]'
 commit=${1:-c09cc1f}
 [[ "$commit" =~ ^[[:xdigit:]]{7,40}$ ]] || die 'Supply a commit hash (7–40 hexadecimal characters).'
