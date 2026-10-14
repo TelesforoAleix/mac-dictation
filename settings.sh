@@ -6,8 +6,16 @@ umask 077
 
 [[ $(uname -s) == Darwin ]] || { printf 'Requires macOS.\n' >&2; exit 1; }
 [[ -d /Applications/VoiceInk.app ]] || { printf 'Run build.sh first.\n' >&2; exit 1; }
-[[ $# == 0 || ( $# == 1 && $1 == --verify ) ]] || { printf 'Usage: ./settings.sh [--verify]\n' >&2; exit 1; }
-verify=${1:-apply}
+verify=apply
+cleanup=on
+for option in "$@"; do
+    case "$option" in
+        --verify) verify=--verify ;;
+        --cleanup-off) cleanup=off ;;
+        *) printf 'Usage: ./settings.sh [--cleanup-off] [--verify]\n' >&2; exit 1 ;;
+    esac
+done
+script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 if [[ "$verify" == apply ]] && pgrep -x VoiceInk >/dev/null; then
     osascript -e 'tell application id "com.prakashjoshipax.VoiceInk" to quit'
     for (( attempt=0; attempt<30; attempt++ )); do
@@ -23,14 +31,15 @@ fi
 # Source: upstream c09cc1f, ModeConfig/ModeRuntimeConfiguration, Shortcut/ShortcutStore,
 # RecordingShortcutManager, AppDefaults, TranscriptionModelManager, UpdaterViewModel.
 # Read only the keys below; encoded values stay in memory and never reach the console.
-/usr/bin/swift - "$verify" <<'SWIFT'
+/usr/bin/swift - "$verify" "$cleanup" "$script_dir/cleanup-prompt.txt" <<'SWIFT'
 import Foundation
 import CoreFoundation
 import AppKit
 import Carbon.HIToolbox
 
 let domain = "com.prakashjoshipax.VoiceInk"
-let verifyOnly = CommandLine.arguments.last == "--verify"
+let verifyOnly = CommandLine.arguments[1] == "--verify"
+let cleanupEnabled = CommandLine.arguments[2] == "on"
 func fail(_ message: String) -> Never {
     fputs(message + "\n", stderr)
     exit(1)
@@ -95,6 +104,53 @@ func command(_ arguments: [String]) {
     guard process.terminationStatus == 0 else { fail("defaults failed; stop and restore the backup if needed.") }
 }
 
+// Custom provider credentials belong to VoiceInk's UI/Keychain, never this script.
+// Validate the preference metadata only; leave every provider entry untouched.
+let providerName = "Local cleanup"
+if cleanupEnabled {
+    guard let data = read(domain, "customAIProviders") as? Data,
+          let providers = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]],
+          providers.filter({ $0["name"] as? String == providerName }).count == 1,
+          let provider = providers.first(where: { $0["name"] as? String == providerName }) else {
+        fail("Add Local cleanup in VoiceInk first; see README's one-time provider step.")
+    }
+    guard let id = provider["id"] as? String, UUID(uuidString: id) != nil,
+          provider["baseURL"] as? String == "http://127.0.0.1:8095/v1/chat/completions",
+          provider["selectedModel"] as? String == "qwen4",
+          provider["models"] as? [String] == ["qwen4"],
+          providers.filter({ ($0["models"] as? [String])?.contains("qwen4") == true
+              || $0["selectedModel"] as? String == "qwen4" }).count == 1 else {
+        fail("Correct Local cleanup in VoiceInk; see README's one-time provider step.")
+    }
+    if verifyOnly { print("Verified: Local cleanup") }
+}
+var prompts = [[String: Any]]()
+let promptTitle = "Local cleanup"
+var promptID = ""
+if cleanupEnabled {
+    if let current = read(domain, "customPrompts") {
+        guard let data = current as? Data,
+              let decoded = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
+            fail("Cannot decode customPrompts; no settings written.")
+        }
+        prompts = decoded
+    }
+    let matches = prompts.indices.filter { prompts[$0]["title"] as? String == promptTitle }
+    guard matches.count <= 1 else { fail("Duplicate Local cleanup prompts; no settings written.") }
+    if let index = matches.first {
+        guard let id = prompts[index]["id"] as? String, UUID(uuidString: id) != nil else {
+            fail("Unexpected customPrompts format; no settings written.")
+        }
+        promptID = id
+    } else { promptID = UUID().uuidString }
+    guard let text = try? String(contentsOfFile: CommandLine.arguments[3], encoding: .utf8) else {
+        fail("Cannot read generic cleanup prompt; no settings written.")
+    }
+    let prompt: [String: Any] = ["id": promptID, "title": promptTitle,
+        "promptText": text.trimmingCharacters(in: .newlines), "useSystemInstructions": false]
+    if let index = matches.first { prompts[index] = prompt } else { prompts.append(prompt) }
+}
+
 // Preserve all other mode fields without printing their contents or replacing the modes.
 // ModeConfig stores a JSON-encoded [ModeConfig] as UserDefaults Data.
 guard let data = read(domain, "modeConfigurationsV2") as? Data,
@@ -115,6 +171,14 @@ for index in modes.indices {
     modes[index]["isAIEnhancementEnabled"] = false
     modes[index]["useScreenCapture"] = false
 }
+if cleanupEnabled {
+    modes[defaultIndex]["isAIEnhancementEnabled"] = true
+    modes[defaultIndex]["selectedAIProvider"] = "Custom"
+    modes[defaultIndex]["selectedAIModel"] = "qwen4"
+    modes[defaultIndex]["selectedPrompt"] = promptID
+    modes[defaultIndex]["useClipboardContext"] = false
+    modes[defaultIndex]["useSelectedTextContext"] = false
+}
 modes[defaultIndex]["isEnabled"] = true
 modes[defaultIndex]["selectedTranscriptionModelName"] = "ggml-large-v3-turbo"
 modes[defaultIndex]["selectedLanguage"] = "auto"
@@ -126,6 +190,12 @@ let fnShortcut: [String: Any] = [
 ]
 var settings = [Setting]()
 func add(_ key: String, _ value: Value) { settings.append(Setting(domain: domain, key: key, value: value)) }
+if cleanupEnabled {
+    add("customPrompts", .data(json(prompts)))
+    add("AutoLearnDictionaryProvider", .string("Custom"))
+    add("AutoLearnDictionaryModel", .string("qwen4"))
+}
+add("IsAutoLearnDictionaryEnabled", .bool(cleanupEnabled))
 add("modeConfigurationsV2", .data(json(modes)))
 add("activeConfigurationId", .string(defaultID))
 add("CurrentTranscriptionModel", .string("ggml-large-v3-turbo"))
@@ -137,7 +207,7 @@ add("Shortcut_primaryRecording_cleared", .absent)
 add("secondaryRecordingShortcut", .string("none"))
 add("Shortcut_secondaryRecording", .absent)
 add("Shortcut_secondaryRecording_cleared", .bool(true))
-for key in ["IsAutoLearnDictionaryEnabled", "IsAudioCleanupEnabled", "IsTranscriptionCleanupEnabled",
+for key in ["IsAudioCleanupEnabled", "IsTranscriptionCleanupEnabled",
             "enableAnnouncements", "SUEnableAutomaticChecks", "VoiceInkChecksForUpdatesOnLaunch"] {
     add(key, .bool(false))
 }

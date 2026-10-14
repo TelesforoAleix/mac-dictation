@@ -1,6 +1,6 @@
 # mac-dictation
 
-Two scripts build unmodified upstream [VoiceInk](https://github.com/Beingpax/VoiceInk) at a chosen commit and apply local dictation settings. There is no fork, patch, or dependency pin. This repository holds code only; VoiceInk keeps recordings, transcripts, settings, models, vocabulary, and replacements on the Mac. These scripts are MIT licensed; VoiceInk is GPLv3.
+Scripts build unmodified upstream [VoiceInk](https://github.com/Beingpax/VoiceInk) at a chosen commit and apply local dictation settings. There is no fork, patch, or dependency pin. This repository holds code only; VoiceInk keeps recordings, transcripts, settings, models, vocabulary, and replacements on the Mac. These scripts are MIT licensed; VoiceInk is GPLv3.
 
 ## Prerequisites
 
@@ -25,6 +25,8 @@ Run in a normal terminal outside a restricted sandbox, from this repository:
 
 ```bash
 ./build.sh
+./cleanup-server.sh install
+# Complete the one-time provider step below before applying settings.
 ./settings.sh
 ./settings.sh --verify
 ```
@@ -34,7 +36,8 @@ Run in a normal terminal outside a restricted sandbox, from this repository:
 `settings.sh` quits VoiceInk and, before any settings write, exports the current preferences domain to a dated private backup under `$HOME/Library/Application Support/mac-dictation/`. It prints the restore command, never backup contents. It applies:
 
 - Default mode: local `ggml-large-v3-turbo`, language Auto, enabled and selected.
-- AI enhancement off in every mode, with Screen Recording context disabled; Auto Learn off.
+- Default mode: AI enhancement on with the local Custom model `qwen4` and the generic cleanup prompt, with Use System Instructions off. Selected-text, clipboard and screen context are off. Enhancement and screen context remain off in other modes.
+- Auto Learn on, pinned to Custom / `qwen4`, so candidate review stays local.
 - Audio cleanup and transcript cleanup off, keeping all recordings and transcripts.
 - Fn (🌐) as the primary recording shortcut in hybrid mode; no secondary recording shortcut.
 - Announcements, Sparkle automatic checks, and VoiceInk's update probe off.
@@ -42,13 +45,44 @@ Run in a normal terminal outside a restricted sandbox, from this repository:
 
 The encoded mode and shortcut formats are taken from the default upstream commit. Other mode fields and unrelated preferences are preserved. Model and language choices in other modes are preserved, so per-app modes can override the default. The script reads only keys needed for comparison and never prints encoded settings or private content. It writes through `defaults`, verifies readback, and relaunches VoiceInk. A second run with matching settings reports `No change` and creates no new backup. `--verify` checks settings without quitting the app or writing preferences, and reports only key names and pass/mismatch status.
 
+## Local cleanup server and one-time provider step
+
+The server requires `/opt/homebrew/bin/llama-server` (validated configuration: 0.6.0) and runs on `127.0.0.1:8095` only. Ports 8091 and 8092 are untouched. Before installing, stop the manually launched cleanup server; the installer refuses an occupied port when its own agent is not loaded. The orchestrator uses `pkill -x llama-server` for the known manual process.
+
+`cleanup-server.sh install` checks SHA256 `8cdb57cbb880d313736a9bc4e3d3d2485f145b5e19cf33783746e753e82641fc` for `$HOME/Library/Application Support/mac-dictation/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf`. If absent, it announces the 2,497,280,448-byte download from `lmstudio-community/Qwen3-4B-Instruct-2507-GGUF` on Hugging Face and checks the hash before installation. A mismatch stops installation. Model downloads are the only external model traffic; inference stays local.
+
+The script generates `$HOME/Library/LaunchAgents/org.mac-dictation.cleanup.plist` with RunAtLoad and KeepAlive, bootstraps it, and waits for `/health` HTTP 200 for up to 60 seconds. It uses the fixed GPU, context and thread settings, thinking off, and `--samplers top_k --top-k 1` to force greedy decoding even though VoiceInk sends temperature 0.3. Logs are under `$HOME/Library/Logs/mac-dictation/`; keep these outside the repository. Reinstalling replaces only this agent. `./cleanup-server.sh status` checks health and reports the agent process's resident memory in KiB and GiB. The measured idle memory was 3.6 GiB on an M4 Pro; the measurement's 12 items took 0.86 seconds median and 1.5 seconds maximum. Actual memory and delay must be checked on the running Mac.
+
+**One-time provider step (owner, in VoiceInk):** open Settings → Models → Custom, click the add button beside **Custom Enhancement Models**, and enter these fields:
+
+| Field | Value |
+| --- | --- |
+| Display Name | `Local cleanup` |
+| Base URL | `http://127.0.0.1:8095/v1/chat/completions` |
+| Model Name | `qwen4` |
+| API Key | `local` |
+
+Despite the “Base URL” label, upstream's editor expects the full chat-completions endpoint. Save the provider; use its connection test with the server running. VoiceInk itself stores the placeholder key in the Keychain. The scripts never read or write the Keychain, never create a provider, and leave `customAIProviders` and `TranscriptionPrompt` untouched. The provider preferences and Keychain survive app rebuilds. Avoid another provider using model `qwen4`: upstream resolves Custom providers by model name. If `Local cleanup` is missing, settings exits nonzero with an instruction to this step; incorrect or ambiguous metadata also stops it. `--verify` reports presence by name only and cannot verify the Keychain credential.
+
+After saving, run `./settings.sh` twice (the second should report `No change`), then `./settings.sh --verify`. The script preserves existing custom prompts and adds or updates the prompt titled `Local cleanup` from [cleanup-prompt.txt](cleanup-prompt.txt), verbatim without added system instructions. Reopen VoiceInk after applying settings. **The server must be healthy before dictating with cleanup**; run `./cleanup-server.sh status`. `./cleanup-server.sh test` sends two generic synthetic Spanish requests at temperature 0.3 and checks identical Spanish cleanup, printing only pass/fail.
+
+To return to D1's cleanup behaviour:
+
+```bash
+./settings.sh --cleanup-off
+./settings.sh --cleanup-off --verify
+./cleanup-server.sh uninstall
+```
+
+This disables enhancement in all modes and Auto Learn, unloads the agent, and removes its generated plist. The model, logs, UI-created provider, Keychain and custom prompts are retained. The transcription model, language, Fn shortcut and recording retention stay as in D1. Both recording-deletion keys remain false in either configuration.
+
 ## Permissions and manual steps
 
 Launch `/Applications/VoiceInk.app` and grant Microphone and Accessibility to that app in System Settings → Privacy & Security. Remove stale entries for the old Downloads copy if shown. An ad hoc rebuild may require these permissions again. **After granting permissions, quit and reopen VoiceInk**, including after a rebuild that asks for permissions again. If VoiceInk was launched before Accessibility was granted, Fn may do nothing until the app is reopened: upstream creates its shortcut event tap at launch and does not retry it. Finish or skip onboarding without enabling a cloud provider or Screen Recording, and rerun `settings.sh` if onboarding changes a decided setting.
 
 Enable **Launch at Login** in VoiceInk Settings → General. Upstream implements this through `SMAppService.mainApp` registration, not a preferences key, so the script cannot enable it with `defaults write`. Approve it in macOS Login Items if macOS requests that.
 
-Confirm the default mode displays large-v3-turbo, Auto, and enhancement off in VoiceInk. For the dictation check, confirm that the default mode is in use in each target app; a per-app mode may select another model or language. Confirm System Settings → Keyboard → “Press 🌐 key to” displays **Do Nothing**. The zero value was checked against macOS 27's Keyboard Settings Fn picker; if a changed preference has not taken effect, select Do Nothing in that pane.
+Confirm the default mode displays large-v3-turbo, Auto, and enhancement on in VoiceInk. For the dictation check, confirm that the default mode is in use in each target app; a per-app mode may select another model or language. Confirm System Settings → Keyboard → “Press 🌐 key to” displays **Do Nothing**. The zero value was checked against macOS 27's Keyboard Settings Fn picker; if a changed preference has not taken effect, select Do Nothing in that pane.
 
 Hybrid Fn uses a short press to start and another to stop; holding Fn for more than half a second while speaking uses push-to-talk and releasing ends the recording. Verify insertion at the cursor, correct language, and no translation in Word, Teams, VS Code, a terminal chat session, Chrome, and Safari, using English, Spanish, and Catalan. Report pass or fail and timing/indicator notes only; do not put dictated text in this repository or a PR.
 
@@ -72,7 +106,7 @@ To restore preferences, quit VoiceInk, run the exact `defaults import com.prakas
 Before every commit:
 
 ```bash
-shellcheck build.sh settings.sh check-no-data.sh
+shellcheck build.sh settings.sh cleanup-server.sh check-no-data.sh
 bash check-no-data.sh
 ```
 
