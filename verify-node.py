@@ -26,39 +26,59 @@ print(json.dumps(dict(recordings=sum(p.suffix=='.wav' for p in files),
     return json.loads(result.stdout)
 
 
+def cleanup_probe():
+    code = '''import os
+from pathlib import Path
+root=Path('/srv/homelab/voice-data/originals/dictation')
+probe=root/'.w1-validation'
+if probe.exists():
+    if probe.is_symlink() or not probe.is_dir() or probe.parent != root:
+        raise SystemExit(2)
+    entries=list(probe.iterdir())
+    if len(entries)!=1 or entries[0].name!='synthetic.txt' or entries[0].is_symlink() or not entries[0].is_file():
+        raise SystemExit(3)
+    entries[0].unlink()
+    probe.rmdir()'''
+    subprocess.run(['ssh', 'homelab-agent', 'sudo python3 -c', code],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+
 def verify(key):
     expected = hashlib.sha256(b'synthetic first version\n').hexdigest()
-    with tempfile.TemporaryDirectory(prefix='dictation-probe-') as directory:
-        batch = Path(directory)
-        (batch / '.w1-validation').mkdir()
-        probe = batch / '.w1-validation/synthetic.txt'
-        probe.write_bytes(b'synthetic first version\n')
-        recheck.send(batch, key)
-        before = admin_audit()
-        if before['probe_hash'] != expected or before['escape_exists']:
-            raise recheck.SafeError('Synthetic probe precondition failed.')
-        probe.write_bytes(b'synthetic attempted replacement\n')
-        recheck.send(batch, key)
-        after = admin_audit()
-        if after != before:
-            raise recheck.SafeError('Additive copy verification failed.')
-    print('Synthetic uploads: 2; overwrites: 0.')
-    probes = {
-        'shell': 'id',
-        'read': 'rsync --server --sender -r . ./',
-        'outside write': 'rsync --server -r . ../w1-escape',
-    }
-    for name, command in probes.items():
-        result = subprocess.run(recheck.ssh_command(key) + [recheck.NODE, command],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        # Require the rrsync rejection, not an authentication/network failure.
-        expected_error = {'shell': b'SSH_ORIGINAL_COMMAND does not run rsync',
-                          'read': b'reading from write-only server is not allowed',
-                          'outside write': b'do not use .. in arg'}[name]
-        if result.returncode == 0 or expected_error not in result.stderr:
-            raise recheck.SafeError('Restriction probe failed (output suppressed): ' + name)
-        print('Refused: ' + name + '.')
-    print('Node recordings: {}; history files: {}.'.format(after['recordings'], after['history']))
+    try:
+        with tempfile.TemporaryDirectory(prefix='dictation-probe-') as directory:
+            batch = Path(directory)
+            (batch / '.w1-validation').mkdir()
+            probe = batch / '.w1-validation/synthetic.txt'
+            probe.write_bytes(b'synthetic first version\n')
+            recheck.send(batch, key)
+            before = admin_audit()
+            if before['probe_hash'] != expected or before['escape_exists']:
+                raise recheck.SafeError('Synthetic probe precondition failed.')
+            probe.write_bytes(b'synthetic attempted replacement\n')
+            recheck.send(batch, key)
+            after = admin_audit()
+            if after != before:
+                raise recheck.SafeError('Additive copy verification failed.')
+        print('Synthetic uploads: 2; overwrites: 0.')
+        probes = {
+            'shell': 'id',
+            'read': 'rsync --server --sender -r . ./',
+            'outside write': 'rsync --server -r . ../w1-escape',
+        }
+        for name, command in probes.items():
+            result = subprocess.run(recheck.ssh_command(key) + [recheck.NODE, command],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            expected_error = {'shell': b'SSH_ORIGINAL_COMMAND does not run rsync',
+                              'read': b'reading from write-only server is not allowed',
+                              'outside write': b'do not use .. in arg'}[name]
+            if result.returncode == 0 or expected_error not in result.stderr:
+                raise recheck.SafeError('Restriction probe failed (output suppressed): ' + name)
+            print('Refused: ' + name + '.')
+        print('Node recordings: {}; history files: {}.'.format(after['recordings'], after['history']))
+    finally:
+        # Synthetic probes must never remain under originals, including on assertion failure.
+        cleanup_probe()
 
 
 if __name__ == '__main__':

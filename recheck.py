@@ -181,9 +181,10 @@ def assess_batch(entries, work, model, cli):
     read_failures = 0
     for row, audio, output in candidates:
         read_error = ("error: failed to read audio file '" + str(audio) + "'").encode()
-        if read_error in result.stderr and not output.exists():
+        if read_error in result.stderr:
             unreadable += 1
             read_failures += 1
+            output.unlink(missing_ok=True)
             continue
         if not output.is_file():
             raise SafeError('Whisper output missing; no upload started (output suppressed).')

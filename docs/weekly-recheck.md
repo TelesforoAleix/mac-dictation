@@ -102,10 +102,12 @@ Run once by hand after installing the model and key:
 Only share the count-only output. Never show the review or history contents.
 `verify-node.py` uses the dedicated key to upload a synthetic file twice with changed
 content, then checks its hash through administrative SSH to prove zero overwrites.
-It leaves the small synthetic `.w1-validation/synthetic.txt` in the backup folder.
 It separately tries an SSH command, an rsync read, and a `../` write escape, requiring
 rrsync refusals rather than authentication failures. It reports aggregate WAV/history
 counts using administrative SSH; the write-only job key cannot audit remote files.
+Its `finally` cleanup removes the one known synthetic probe file and its empty
+directory from `originals/`, even if another probe fails. It refuses unexpected
+contents and never recursively removes that directory.
 
 Register the schedule only after the hand run and probes pass:
 
@@ -115,8 +117,8 @@ Register the schedule only after the hand run and probes pass:
   /opt/homebrew/bin/python3 "$HOME/Code/mac-dictation/recheck.py"
 ```
 
-The profile controller reads `$HOME/.config/homelab/profiles.json`. Its current
-implementation permits jobs with a per-profile boolean, **not** a list of job names:
+The profile controller reads `$HOME/.config/homelab/profiles.json`. It permits jobs
+with a per-profile boolean:
 set `profiles.working.jobs` to `true` for Working and, if desired,
 `profiles.inference.jobs` to `true` for Inference. Both default to `true` when omitted.
 For example, merge `"jobs": true` into the existing `profiles.working` object; preserve
@@ -126,6 +128,42 @@ The orchestrator owns this private configuration; this repository does not read 
 change it.
 The slot waits for AC power and idle time and handles missed runs. Do not switch
 profiles or use the slot's manual run command for validation.
+
+Job commands are argument arrays launched directly, without a shell. Pass the script
+path as `"$HOME/Code/mac-dictation/recheck.py"` so the calling shell expands it. Do
+not pass the literal `~/Code/...`: tilde expansion would not occur inside the saved
+argument. If a job was registered with that literal, this guarded repair changes only
+its command and preserves its schedule; it uses the profile controller's own lock and
+atomic save. No LaunchAgent reload is required because the agent invokes the stable
+`job-worker` entry point, which reads the saved command when the Sunday run starts.
+
+```bash
+/opt/homebrew/bin/python3 - <<'PY'
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
+import sys
+
+profile_path = Path.home() / 'Code/homelab-v2/mac/homelab-profile'
+spec = spec_from_file_location('homelab_profile', profile_path)
+profile = module_from_spec(spec)
+sys.modules[spec.name] = profile
+spec.loader.exec_module(profile)
+expected = ['/opt/homebrew/bin/python3', '~/Code/mac-dictation/recheck.py']
+corrected = ['/opt/homebrew/bin/python3',
+             str((Path.home() / 'Code/mac-dictation/recheck.py').resolve())]
+with profile.lock():
+    records = profile.jobs()
+    job = records.get('dictation-recheck')
+    assert job is not None
+    assert job['calendar'] == {'Weekday': 0, 'Hour': 3, 'Minute': 0}
+    if job['command'] == expected:
+        job['command'] = corrected
+        profile.save(profile.STATE / 'jobs.json', records)
+    else:
+        assert job['command'] == corrected
+print('dictation-recheck command is absolute; Sunday 03:00 calendar preserved.')
+PY
+```
 
 ## Private files and recovery
 
@@ -200,33 +238,6 @@ not replaced. A crash after upload but before progress commit may resend the bat
 ignore-existing makes this safe. Completed review and staging retention is manual
 in this slice. The node key is write-only, not append-enforced against a malicious
 client: `rrsync -wo` confines writes, while the job's flags enforce additive copies.
-
-The initial failed hand run predates this staging scheme. Its orphaned folder can
-be removed outside the sandbox with this guarded command. It removes only the
-reported incomplete copies, with no progress/pending state and no history/review:
-
-```bash
-/opt/homebrew/bin/python3 -B - <<'PY'
-from pathlib import Path
-import re
-import shutil
-root = Path.home() / 'Library/Application Support/mac-dictation'
-assert not (root / 'recheck-state.json').exists()
-assert not (root / 'recheck-pending.json').exists()
-folders = list((root / 'rechecks').glob('05c0e6*'))
-assert len(folders) == 1
-folder = folders[0]
-assert folder.is_dir() and not folder.is_symlink()
-assert re.fullmatch(r'[0-9a-f]{32}', folder.name)
-paths = list(folder.rglob('*'))
-assert not any(p.is_symlink() for p in paths)
-files = [p for p in paths if p.is_file()]
-assert len(files) == 56
-assert all(p.parent == folder / 'upload/recordings' and p.suffix == '.wav' for p in files)
-shutil.rmtree(folder)
-print('Incomplete run folders removed: 1; staged copies removed: 56.')
-PY
-```
 
 ## Repository validation
 

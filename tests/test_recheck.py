@@ -245,6 +245,8 @@ class RecheckTests(unittest.TestCase):
             self.assertEqual(inputs, [str(good), str(broken)])
             self.assertEqual(kwargs['stdout'], subprocess.DEVNULL)
             self.assertEqual(kwargs['stderr'], subprocess.PIPE)
+            # whisper-cli opens the output file before decoding each input.
+            Path(outputs[1] + '.txt').touch()
             Path(outputs[0] + '.txt').write_text('synthetic recheck')
             error = ("error: failed to read audio file '" + str(broken) + "'\n"
                      'error: 1 input file(s) failed\n').encode()
@@ -256,6 +258,7 @@ class RecheckTests(unittest.TestCase):
         run.assert_called_once()
         self.assertEqual(len(reviews), 1)
         self.assertEqual(unreadable, 2)
+        self.assertFalse((work / '2.txt').exists())
 
     def test_all_empty_audio_skips_cli_entirely(self):
         empty = self.audio_fixture('empty.wav', 0)
