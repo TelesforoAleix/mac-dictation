@@ -115,9 +115,15 @@ Register the schedule only after the hand run and probes pass:
   /opt/homebrew/bin/python3 "$HOME/Code/mac-dictation/recheck.py"
 ```
 
-The existing private profile configuration must permit `dictation-recheck` in the
-intended profiles. Registration alone grants no profile permission. The orchestrator
-owns that prerequisite; this repository does not read or change the private config.
+The profile controller reads `$HOME/.config/homelab/profiles.json`. Its current
+implementation permits jobs with a per-profile boolean, **not** a list of job names:
+set `profiles.working.jobs` to `true` for Working and, if desired,
+`profiles.inference.jobs` to `true` for Inference. Both default to `true` when omitted.
+For example, merge `"jobs": true` into the existing `profiles.working` object; preserve
+all other fields. Do not add a `dictation-recheck` key. This permission applies to all
+registered jobs in that profile. Registration does not override `"jobs": false`.
+The orchestrator owns this private configuration; this repository does not read or
+change it.
 The slot waits for AC power and idle time and handles missed runs. Do not switch
 profiles or use the slot's manual run command for validation.
 
@@ -133,6 +139,8 @@ redirected inside this private directory, never into the repository.
 | --- | --- |
 | `recheck-state.json` | Version 1; `last_run` (Unix seconds), `processed_ids`, `latest_run` |
 | `recheck-pending.json` | Durable transaction: run ID, row IDs, time and counts; retained on upload failure |
+| `rechecks/<run-id>/summary.json` | Version 1; counts of rows, recordings, assessed, unreadable and review items |
+| `recheck-building/` | Pre-upload staging, cleaned on build failure or replaced after interruption |
 | `rechecks/<run-id>/review.json` | Version 1, run ID, `items` in descending score order, maximum 20 |
 | `rechecks/<run-id>/upload/history/<run-id>.jsonl` | One row per selected history entry |
 | `rechecks/<run-id>/upload/recordings/` | Copies of recordings selected in that run |
@@ -157,7 +165,18 @@ entries later completed must not be lost. A successful run advances `last_run` a
 records processed IDs only after rsync succeeds. Edits to an already processed
 history entry do not cause a second assessment. Missing/unsafe recordings stop the
 batch instead of silently marking them processed. Entries without audio are backed
-up as history, with no assessment.
+up as history, with no assessment. Zero-frame WAVs and confirmed Whisper audio-read
+failures are backed up with their history but skipped for assessment. Their count
+is stored as `unreadable` in the private summary and printed by the hand run and
+`status`, without filenames. Missing or unsafe paths still fail because the job
+cannot safely back up their audio.
+
+Whisper loads large-v3 once per run and accepts all candidate clips with separate
+output files. Zero-frame WAVs are filtered before inference; other decoding failures
+are recognized from Whisper's suppressed, in-memory diagnostics. Exit 11 is accepted
+only when its failed-input count matches confirmed audio-read failures. Model,
+inference and output failures abort the build instead of silently losing assessments.
+Nothing from Whisper's stdout or stderr is printed or saved.
 
 Each snapshot copies the database and any WAL/SHM sidecars using plain file I/O.
 SQLite receives only a path in the private temporary folder and opens it read-only.
@@ -168,15 +187,46 @@ Schema mismatch stops without retrying or uploading. Integrity checking detects
 structural corruption; it is not a guarantee that a concurrent plain copy captured
 every latest commit. The processed-ID ledger catches unobserved entries on later runs.
 
-After assessment, the immutable upload batch and review are staged privately, then
-a pending transaction is written. On transfer failure, the next run resends that
-same batch before new work. rsync uses `-rt --ignore-existing`, never `--delete`.
-Files already on the node are not replaced. A crash after upload but before progress
-commit may resend the batch; ignore-existing makes this safe. A crash earlier in
-assessment can leave an unreferenced private run folder; it is not progress state
-and no owner data is automatically deleted. Review and staging retention is manual
+The batch, review and count-only summary are first built in `recheck-building/`.
+A build exception removes this staging, before any upload starts. If the process
+is interrupted before a pending transaction exists, the next run removes incomplete
+staging and rebuilds it. Completed staging is recorded in `recheck-pending.json`
+**before** promotion to `rechecks/<run-id>/`; an interruption during promotion is
+resumed from that transaction. Thus retry never ignores a half-built new run folder.
+
+On transfer failure, the next run resends that same complete batch before new work.
+rsync uses `-rt --ignore-existing`, never `--delete`. Files already on the node are
+not replaced. A crash after upload but before progress commit may resend the batch;
+ignore-existing makes this safe. Completed review and staging retention is manual
 in this slice. The node key is write-only, not append-enforced against a malicious
 client: `rrsync -wo` confines writes, while the job's flags enforce additive copies.
+
+The initial failed hand run predates this staging scheme. Its orphaned folder can
+be removed outside the sandbox with this guarded command. It removes only the
+reported incomplete copies, with no progress/pending state and no history/review:
+
+```bash
+/opt/homebrew/bin/python3 -B - <<'PY'
+from pathlib import Path
+import re
+import shutil
+root = Path.home() / 'Library/Application Support/mac-dictation'
+assert not (root / 'recheck-state.json').exists()
+assert not (root / 'recheck-pending.json').exists()
+folders = list((root / 'rechecks').glob('05c0e6*'))
+assert len(folders) == 1
+folder = folders[0]
+assert folder.is_dir() and not folder.is_symlink()
+assert re.fullmatch(r'[0-9a-f]{32}', folder.name)
+paths = list(folder.rglob('*'))
+assert not any(p.is_symlink() for p in paths)
+files = [p for p in paths if p.is_file()]
+assert len(files) == 56
+assert all(p.parent == folder / 'upload/recordings' and p.suffix == '.wav' for p in files)
+shutil.rmtree(folder)
+print('Incomplete run folders removed: 1; staged copies removed: 56.')
+PY
+```
 
 ## Repository validation
 
@@ -189,7 +239,8 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 Fixtures are constructed from synthetic rows. Tests cover WAL replay, source hashes
 (including a second connection committing during the file copy), rejection of SQLite
 opens on original paths, corruption retry/skip, schema rejection, pending and tied
-history timestamps, normalization, ranking, confinement and upload retry state.
+history timestamps, normalization, ranking, confinement, unreadable-audio backup,
+batch model loading, pre-upload cleanup, interrupted promotion and upload retry state.
 The concurrent-writer test compares all three source hashes immediately after the
 writer's deliberate commit with their hashes after the reader returns: the reader
 must add no changes beyond the test writer's own commit.

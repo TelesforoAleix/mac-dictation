@@ -1,6 +1,8 @@
 """Synthetic-only fixtures; no VoiceInk owner files are opened."""
 import json
 import hashlib
+import subprocess
+import wave
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -194,10 +196,11 @@ class RecheckTests(unittest.TestCase):
         def installed(path):
             return str(path) == '/opt/homebrew/bin/whisper-cli' or original_is_file(path)
 
-        def whisper(args):
+        def whisper(args, **kwargs):
             Path(args[args.index('-of') + 1] + '.txt').write_text('synthetic different')
+            return subprocess.CompletedProcess(args, 0, stderr=b'')
 
-        with patch.object(Path, 'is_file', installed), patch.object(r, 'run_quiet', side_effect=whisper), \
+        with patch.object(Path, 'is_file', installed), patch.object(r.subprocess, 'run', side_effect=whisper), \
                 patch.object(r, 'send') as send, patch('builtins.print'):
             r.execute(root, self.root)
             r.execute(root, self.root)
@@ -217,6 +220,135 @@ class RecheckTests(unittest.TestCase):
         for path in root.rglob('*'):
             self.assertFalse(path.stat().st_mode & 0o077)
         self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+
+    def audio_fixture(self, name, frames):
+        path = self.root / name
+        with wave.open(str(path), 'wb') as stream:
+            stream.setnchannels(1)
+            stream.setsampwidth(2)
+            stream.setframerate(16000)
+            stream.writeframes(b'\0\0' * frames)
+        return path
+
+    def test_batch_loads_once_and_skips_empty_and_decoder_failure(self):
+        good = self.audio_fixture('good.wav', 100)
+        empty = self.audio_fixture('empty.wav', 0)
+        broken = self.root / 'broken.wav'
+        broken.write_bytes(b'synthetic invalid audio')
+        row = {'id': 'synthetic', 'text': 'synthetic', 'audio_url': 'synthetic'}
+        work = self.root / 'work'
+        work.mkdir()
+
+        def whisper(args, **kwargs):
+            inputs = [args[i + 1] for i, value in enumerate(args) if value == '-f']
+            outputs = [args[i + 1] for i, value in enumerate(args) if value == '-of']
+            self.assertEqual(inputs, [str(good), str(broken)])
+            self.assertEqual(kwargs['stdout'], subprocess.DEVNULL)
+            self.assertEqual(kwargs['stderr'], subprocess.PIPE)
+            Path(outputs[0] + '.txt').write_text('synthetic recheck')
+            error = ("error: failed to read audio file '" + str(broken) + "'\n"
+                     'error: 1 input file(s) failed\n').encode()
+            return subprocess.CompletedProcess(args, 11, stderr=error)
+
+        with patch.object(r.subprocess, 'run', side_effect=whisper) as run:
+            reviews, unreadable = r.assess_batch([(row, good), (row, empty), (row, broken)],
+                                                work, self.root / 'model', Path('cli'))
+        run.assert_called_once()
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(unreadable, 2)
+
+    def test_all_empty_audio_skips_cli_entirely(self):
+        empty = self.audio_fixture('empty.wav', 0)
+        with patch.object(r.subprocess, 'run') as run:
+            self.assertEqual(r.assess_batch([({}, empty)], self.root, Path('model'), Path('cli')), ([], 1))
+        run.assert_not_called()
+
+    def test_runtime_failure_and_output_failure_are_fatal(self):
+        audio = self.audio_fixture('good.wav', 100)
+        for status, error in ((3, b'synthetic model failure'),
+                              (11, b'error: 1 input file(s) failed')):
+            with self.subTest(status=status), patch.object(r.subprocess, 'run',
+                    return_value=subprocess.CompletedProcess([], status, stderr=error)):
+                with self.assertRaises(r.SafeError):
+                    r.assess_batch([({'text': 'synthetic'}, audio)], self.root, Path('model'), Path('cli'))
+
+    def test_decoder_error_does_not_mask_an_output_write_error(self):
+        good = self.audio_fixture('good.wav', 100)
+        broken = self.root / 'broken.wav'
+        broken.write_bytes(b'synthetic broken audio')
+        row = {'id': 'synthetic', 'text': 'synthetic'}
+
+        def whisper(args, **kwargs):
+            outputs = [args[i + 1] for i, value in enumerate(args) if value == '-of']
+            Path(outputs[0] + '.txt').write_text('synthetic partial output')
+            error = ("error: failed to read audio file '" + str(broken) + "'\n"
+                     'error: 2 input file(s) failed\n').encode()
+            return subprocess.CompletedProcess(args, 11, stderr=error)
+
+        with patch.object(r.subprocess, 'run', side_effect=whisper):
+            with self.assertRaisesRegex(r.SafeError, 'batch failed'):
+                r.assess_batch([(row, good), (row, broken)], self.root, Path('model'), Path('cli'))
+
+    def test_empty_recording_and_history_are_backed_up_with_summary(self):
+        identifier = self.add()
+        recordings = self.root / 'Recordings'
+        recordings.mkdir()
+        audio = self.audio_fixture('empty.wav', 0)
+        target = recordings / (identifier + '.wav')
+        audio.rename(target)
+        self.db.execute('UPDATE ZTRANSCRIPTION SET ZAUDIOFILEURL=?', (target.as_uri(),))
+        self.db.commit()
+        root = self.root / 'private'
+        (root / 'models').mkdir(parents=True, mode=0o700)
+        (root / 'models/ggml-large-v3.bin').touch(mode=0o600)
+        (root / 'dictation-node-key').touch(mode=0o600)
+        is_file = Path.is_file
+        with patch.object(Path, 'is_file', lambda path: str(path) == '/opt/homebrew/bin/whisper-cli' or is_file(path)), \
+                patch.object(r, 'send') as send, patch.object(r.subprocess, 'run') as run, patch('builtins.print'):
+            r.execute(root, self.root)
+        send.assert_called_once()
+        run.assert_not_called()
+        state = json.loads((root / 'recheck-state.json').read_text())
+        run_dir = root / 'rechecks' / state['latest_run']
+        summary = json.loads((run_dir / 'summary.json').read_text())
+        self.assertEqual((summary['recordings'], summary['assessed'], summary['unreadable']), (1, 0, 1))
+        self.assertEqual((run_dir / 'upload/recordings' / target.name).read_bytes(), target.read_bytes())
+        self.assertEqual(len(list((run_dir / 'upload/history').glob('*.jsonl'))), 1)
+        self.assertEqual(state['processed_ids'], [identifier])
+        self.assertFalse((root / 'recheck-building').exists())
+
+    def test_pre_upload_failure_removes_building_and_retry_replaces_crash_staging(self):
+        root = self.root / 'private'
+        (root / 'models').mkdir(parents=True, mode=0o700)
+        (root / 'models/ggml-large-v3.bin').touch()
+        pending = root / 'recheck-pending.json'
+        with patch.object(Path, 'is_file', return_value=True), \
+                patch.object(r, 'assess_batch', side_effect=r.SafeError('synthetic model error')):
+            with self.assertRaises(r.SafeError):
+                r.build_run([], root, self.root, 'synthetic', pending)
+        self.assertFalse((root / 'recheck-building').exists())
+        self.assertFalse(pending.exists())
+        (root / 'recheck-building').mkdir()
+        (root / 'recheck-building/stale').touch()
+        with patch.object(Path, 'is_file', return_value=True), patch.object(r, 'assess_batch', return_value=([], 0)):
+            r.build_run([], root, self.root, 'synthetic', pending)
+        self.assertFalse((root / 'recheck-building/stale').exists())
+        self.assertTrue(pending.exists())
+
+    def test_pending_staging_is_promoted_and_resumed_after_crash(self):
+        self.add()
+        root = self.root / 'private'
+        (root / 'recheck-building/upload').mkdir(parents=True)
+        (root / 'dictation-node-key').touch(mode=0o600)
+        pending = dict(run_id='synthetic', ids=['new'], last_run=123, rows=1,
+                       recordings=0, items=0, unreadable=1)
+        (root / 'recheck-pending.json').write_text(json.dumps(pending))
+        with patch.object(r, 'send') as send, patch('builtins.print'):
+            r.execute(root, self.root)
+        send.assert_called_once_with(root / 'rechecks/synthetic/upload', root / 'dictation-node-key')
+        self.assertTrue((root / 'rechecks/synthetic/upload').is_dir())
+        self.assertFalse((root / 'recheck-building').exists())
+        self.assertFalse((root / 'recheck-pending.json').exists())
 
     def test_disabled_job_does_not_read_source(self):
         (self.root / 'recheck-disabled').touch()

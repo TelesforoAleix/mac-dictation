@@ -17,6 +17,7 @@ import time
 import unicodedata
 from urllib.parse import unquote, urlsplit
 import uuid
+import wave
 
 APPLE_EPOCH = 978307200
 PRIVATE = Path.home() / 'Library/Application Support/mac-dictation'
@@ -151,14 +152,97 @@ def rank(items):
                   key=lambda i: (-i['score'], i['id']))[:20]
 
 
-def assess(row, audio, work, model, cli):
-    output = work / 'assessment'
-    output.with_suffix('.txt').unlink(missing_ok=True)
-    run_quiet([str(cli), '-m', str(model), '-l', 'auto', '-f', str(audio),
-               '-otxt', '-of', str(output)])  # Metal enabled by default; no -ng / translation.
-    recheck = output.with_suffix('.txt').read_text(encoding='utf-8').strip()
-    return dict(row, recording='recordings/' + audio.name, recheck=recheck,
-                score=disagreement(row['text'], recheck))
+def assess_batch(entries, work, model, cli):
+    """One model load; only audio-read failures may be skipped."""
+    args = [str(cli), '-m', str(model), '-l', 'auto', '-otxt']
+    candidates = []
+    unreadable = 0
+    for index, (row, audio) in enumerate(entries):
+        # Avoid loading Whisper at all for valid WAV headers with zero frames.
+        try:
+            with wave.open(str(audio), 'rb') as wav:
+                empty = wav.getnframes() == 0
+        except (wave.Error, EOFError):
+            empty = False  # Let Whisper handle formats Python's wave cannot decode.
+        if empty:
+            unreadable += 1
+            continue
+        output = work / str(index)
+        candidates.append((row, audio, output.with_suffix('.txt')))
+        args.extend(['-f', str(audio), '-of', str(output)])
+    if not candidates:
+        return [], unreadable
+    # stderr is examined only in memory and never printed or saved. stdout can
+    # contain transcribed text, so discard it. Metal remains enabled by default.
+    result = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if result.returncode not in (0, 11):
+        raise SafeError('Whisper re-check failed; no upload started (output suppressed).')
+    reviews = []
+    read_failures = 0
+    for row, audio, output in candidates:
+        read_error = ("error: failed to read audio file '" + str(audio) + "'").encode()
+        if read_error in result.stderr and not output.exists():
+            unreadable += 1
+            read_failures += 1
+            continue
+        if not output.is_file():
+            raise SafeError('Whisper output missing; no upload started (output suppressed).')
+        recheck = output.read_text(encoding='utf-8').strip()
+        reviews.append(dict(row, recording='recordings/' + audio.name, recheck=recheck,
+                            score=disagreement(row['text'], recheck)))
+    # Exit 11 also covers output-write failures. Do not silently classify those as bad audio.
+    failures = re.findall(rb'error: (\d+) input file\(s\) failed', result.stderr)
+    if ((result.returncode == 11 and (not failures or int(failures[-1]) != read_failures))
+            or (result.returncode == 0 and read_failures)):
+        raise SafeError('Whisper batch failed; no upload started (output suppressed).')
+    return reviews, unreadable
+
+
+def build_run(selected, root, recordings, run_id, pending):
+    building = root / 'recheck-building'
+    if building.exists():
+        shutil.rmtree(building)  # Incomplete staging from an interrupted pre-upload build.
+    batch = building / 'upload'
+    model = root / 'models/ggml-large-v3.bin'
+    cli = Path('/opt/homebrew/bin/whisper-cli')
+    if not model.is_file() or not cli.is_file():
+        raise SafeError('Install Homebrew whisper.cpp and move large-v3 first; see docs.')
+    try:
+        (batch / 'recordings').mkdir(parents=True, mode=0o700)
+        (batch / 'history').mkdir(mode=0o700)
+        entries = []
+        history = []
+        for row in selected:
+            value = dict(row)
+            value['recording'] = None
+            if row['audio_url']:
+                audio = recording_path(row['audio_url'], recordings)
+                staged_audio = batch / 'recordings' / audio.name
+                shutil.copyfile(audio, staged_audio)
+                entries.append((row, staged_audio))
+                value['recording'] = 'recordings/' + audio.name
+            del value['audio_url']
+            history.append(value)
+        with tempfile.TemporaryDirectory(prefix='assessment-', dir=root) as directory:
+            reviews, unreadable = assess_batch(entries, Path(directory), model, cli)
+        for item in reviews:
+            del item['audio_url']
+        with (batch / 'history' / (run_id + '.jsonl')).open('w', encoding='utf-8') as stream:
+            for row in history:
+                stream.write(json.dumps(row, ensure_ascii=False) + '\n')
+        items = rank(reviews)
+        write_json(building / 'review.json', {'version': 1, 'run_id': run_id, 'items': items})
+        summary = {'version': 1, 'run_id': run_id, 'rows': len(selected),
+                   'recordings': len(entries), 'assessed': len(reviews),
+                   'unreadable': unreadable, 'items': len(items)}
+        write_json(building / 'summary.json', summary)
+        # Persist the transaction BEFORE moving staging to its final run folder.
+        # A crash between these steps is resumed by execute(), never ignored.
+        write_json(pending, dict(summary, ids=[r['id'] for r in selected], last_run=time.time()))
+    except BaseException:
+        if not pending.exists():
+            shutil.rmtree(building, ignore_errors=True)
+        raise
 
 
 def ssh_command(key):
@@ -199,47 +283,18 @@ def execute(root=PRIVATE, voice=VOICEINK):
         rows = snapshot_rows(voice / 'default.store', root)
         pending = root / 'recheck-pending.json'
         if not pending.exists():
+            if (root / 'recheck-building').exists():
+                shutil.rmtree(root / 'recheck-building')
             selected = new_rows(rows, state)
             if not selected:
                 print('New history rows: 0; no upload needed.')
                 return
-            run_id = uuid.uuid4().hex
-            run_dir = root / 'rechecks' / run_id
-            batch = run_dir / 'upload'
-            (batch / 'recordings').mkdir(parents=True, mode=0o700)
-            (batch / 'history').mkdir(mode=0o700)
-            model = root / 'models/ggml-large-v3.bin'
-            cli = Path('/opt/homebrew/bin/whisper-cli')
-            if not model.is_file() or not cli.is_file():
-                raise SafeError('Install Homebrew whisper.cpp and move large-v3 first; see docs.')
-            reviews = []
-            with tempfile.TemporaryDirectory(prefix='assessment-', dir=root) as directory:
-                for row in selected:
-                    if not row['audio_url']:
-                        continue  # Assistant-only history has no recording; still back it up.
-                    audio = recording_path(row['audio_url'], voice / 'Recordings')
-                    shutil.copyfile(audio, batch / 'recordings' / audio.name)
-                    reviews.append(assess(row, audio, Path(directory), model, cli))
-            # History contains only the four requested fields plus stable ID/status, no prompts.
-            # Replace the absolute URL with a relative recording name in all private artifacts.
-            history = []
-            for row in selected:
-                value = dict(row)
-                value['recording'] = ('recordings/' + recording_path(row['audio_url'], voice / 'Recordings').name
-                                      if row['audio_url'] else None)
-                del value['audio_url']
-                history.append(value)
-            for item in reviews:
-                del item['audio_url']
-            with (batch / 'history' / (run_id + '.jsonl')).open('w', encoding='utf-8') as stream:
-                for row in history:
-                    stream.write(json.dumps(row, ensure_ascii=False) + '\n')
-            write_json(run_dir / 'review.json', {'version': 1, 'run_id': run_id, 'items': rank(reviews)})
-            write_json(pending, {'run_id': run_id, 'ids': [r['id'] for r in selected],
-                                 'last_run': time.time(), 'rows': len(selected),
-                                 'recordings': len(reviews), 'items': len(rank(reviews))})
+            build_run(selected, root, voice / 'Recordings', uuid.uuid4().hex, pending)
         transaction = json.loads(pending.read_text())
         run_dir = root / 'rechecks' / transaction['run_id']
+        if not run_dir.exists():
+            run_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            (root / 'recheck-building').replace(run_dir)
         key = root / 'dictation-node-key'
         if key.stat().st_mode & 0o077:
             raise SafeError('Job key must be private (0600).')
@@ -248,8 +303,9 @@ def execute(root=PRIVATE, voice=VOICEINK):
                                'processed_ids': sorted(set(state['processed_ids']) | set(transaction['ids'])),
                                'latest_run': transaction['run_id']})
         pending.unlink()
-        print('History rows: {rows}; recordings: {recordings}; review items: {items}; copy complete.'
-              .format(**transaction))
+        print('History rows: {rows}; recordings: {recordings}; unreadable: {unreadable}; '
+              'review items: {items}; copy complete.'
+              .format(**dict(transaction, unreadable=transaction.get('unreadable', 0))))
 
 
 if __name__ == '__main__':
@@ -260,9 +316,11 @@ if __name__ == '__main__':
                 state = json.loads(state_file.read_text()) if state_file.exists() else {}
                 review = PRIVATE / 'rechecks' / state.get('latest_run', 'none') / 'review.json'
                 count = len(json.loads(review.read_text())['items']) if review.exists() else 0
-                print('Disabled: {}; review exists: {}; review items: {}; processed rows: {}.'
+                summary_file = review.parent / 'summary.json'
+                summary = json.loads(summary_file.read_text()) if summary_file.exists() else {}
+                print('Disabled: {}; review exists: {}; review items: {}; processed rows: {}; unreadable: {}.'
                       .format((PRIVATE / 'recheck-disabled').exists(), review.exists(), count,
-                              len(state.get('processed_ids', []))))
+                              len(state.get('processed_ids', [])), summary.get('unreadable', 0)))
             else:
                 os.umask(0o077)
                 PRIVATE.mkdir(parents=True, exist_ok=True, mode=0o700)

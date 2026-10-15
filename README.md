@@ -116,7 +116,7 @@ CI runs ShellCheck on every tracked shell script, the no-data-files guard, and G
 ## Weekly re-check and node copy
 
 [Weekly setup and recovery](docs/weekly-recheck.md) covers the Mac commands, repeatable node
-setup, file formats and validation. The job re-transcribes new recordings with local Whisper
+setup, file formats and validation. The job loads its model once per run and re-transcribes new recordings with local Whisper
 large-v3 through Homebrew whisper.cpp (Metal, Auto). It compares normalized raw Whisper text
 with the re-check and keeps up to 20 disagreements, largest first. Raw and cleaned text are
 both retained for review. A later slice supplies the review page.
@@ -131,7 +131,9 @@ advancing state if the second copy fails.
 
 Reviews, state, staging, the dedicated key and optional count-only logs stay under
 `$HOME/Library/Application Support/mac-dictation/` (0700), outside this public repository.
-The profile job slot schedules Sunday at 03:00 local time, subject to the existing allowed-job,
+Unreadable and empty recordings retain their additive audio/history backup and are skipped
+for assessment, with only an unreadable count in the private summary and output.
+The profile job slot schedules Sunday at 03:00 local time, subject to the profile jobs permission,
 AC-power and idle checks. The job never changes profiles.
 
 To turn it off (including any already pending scheduled run):
