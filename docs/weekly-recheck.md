@@ -44,13 +44,13 @@ listing the ancestors or reading siblings. The script uses the node's existing
 for the execute bit needed for traversal. It is repeatable with the same public key
 and refuses to replace a different authorized key. It does not alter sshd policy.
 
-**Current deployment blocker:** the node's
-`/etc/ssh/sshd_config.d/10-homelab-hardening.conf` has an `AllowUsers` restriction
-that excludes the new user. Adding the new account to that policy requires separate
-orchestrator authorization because this slice allows only the user, key and folder
-changes. Until resolved, authentication and end-to-end restriction probes cannot
-pass. A rebuild must allow this account for public-key SSH, preserve password
-login restrictions, validate with `sshd -t`, and reload sshd.
+SSH admission is managed by `homelab-v2`, separately from this setup script.
+Its approved PR #36 admits this account through `AllowUsers` and applies a
+`Match User dictation-backup` block disabling forwarding and TTY and forcing the
+same `/usr/bin/rrsync -wo /srv/homelab/voice-data/originals/dictation` command.
+That policy was deployed at node revision `f03df42`. A node rebuild needs both
+that managed SSH policy and this account/key/directory setup. Do not change SSH
+configuration from this repository.
 
 The job resolves `homelab-agent`'s hostname and port with `ssh -G`, then uses
 `ssh -F /dev/null`, strict host-key checking, `IdentitiesOnly=yes`, no SSH agent and
@@ -66,12 +66,13 @@ backup configuration or `homelab-v2`.
 
 Run from the repository in a normal terminal. The CLI is installed durably through
 Homebrew's `whisper.cpp` formula. Homebrew Python supplies the fixed executable for
-the profile job slot; no pip packages are needed.
+the profile job slot; no pip packages are needed. Homebrew rsync is required because
+macOS's system openrsync sends `--dirs`, which the node's rrsync rejects.
 
 ```bash
 set -e
 umask 077
-brew install whisper.cpp python
+brew install whisper.cpp python rsync
 private_dir="$HOME/Library/Application Support/mac-dictation"
 mkdir -p "$private_dir/models"
 chmod 700 "$private_dir" "$private_dir/models"
@@ -90,7 +91,7 @@ If either destination already exists, stop and establish which installation owns
 it; do not replace a durable model or key. The model move intentionally removes
 the scratch copy. The cleanup GGUF remains in the same durable models directory.
 
-After the node's SSH admission blocker is resolved, run once by hand:
+Run once by hand after installing the model and key:
 
 ```bash
 /opt/homebrew/bin/python3 "$HOME/Code/mac-dictation/recheck.py"

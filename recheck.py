@@ -177,7 +177,7 @@ def ssh_command(key):
 
 def send(batch, key):
     ssh = shlex.join(ssh_command(key))
-    run_quiet(['/usr/bin/rsync', '-rt', '--ignore-existing', '-e', ssh,
+    run_quiet(['/opt/homebrew/bin/rsync', '-rt', '--ignore-existing', '-e', ssh,
                '--', str(batch) + '/', NODE + ':./'])
 
 

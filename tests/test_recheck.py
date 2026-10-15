@@ -170,6 +170,7 @@ class RecheckTests(unittest.TestCase):
             run.return_value.stdout = config
             r.send(self.root, self.root / 'key')
         args = quiet.call_args.args[0]
+        self.assertEqual(args[0], '/opt/homebrew/bin/rsync')
         self.assertIn('--ignore-existing', args)
         self.assertNotIn('--delete', args)
         self.assertIn('-F /dev/null', args[args.index('-e') + 1])
