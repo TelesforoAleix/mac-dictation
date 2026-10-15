@@ -172,9 +172,9 @@ notification. Click it, or open the latest batch by hand:
 /opt/homebrew/bin/python3 "$HOME/Code/mac-dictation/review.py"
 ```
 
-Use the play control, compare the highlighted words, then choose **Inserted was right**,
+Use **Play recording** (or the audio controls), compare the highlighted words, then choose **Inserted was right**,
 **Re-check was right**, or type the correct text (prefilled with the re-check). Skipping is
-allowed. The page preserves W1's order and limit of 20. Inserted text shows the cleaned text
+allowed. Playback shows Playing/Paused/Finished, elapsed time and a progress bar even for silent audio. Playback is available while the review server is open. The page preserves W1's order and limit of 20. Inserted text shows the cleaned text
 when available, with the original Whisper text alongside it; the stored text remains an
 insertion proxy rather than a delivery receipt.
 
@@ -216,7 +216,7 @@ The write-only key cannot verify remote contents; its admission and live upload 
 W1 prerequisites. No files are automatically deleted from either destination.
 
 The notification hook compiles a local AppleScript app under the private folder with macOS's
-`osacompile`, then launches it to post the count. Clicking the notification runs that app's
+`osacompile`, then launches it to consume a one-use private notification marker and post the count. That first launch does not open a page. Clicking the notification subsequently runs that app's
 review handler, as described by [Apple's notification documentation](https://developer.apple.com/library/archive/documentation/LanguagesUtilities/Conceptual/MacAutomationScriptingGuide/DisplayNotifications.html).
 No developer signing identity or third-party notifier is used. Allow notifications for
 **Weekly Dictation Review** in System Settings if macOS requests it. GUI delivery and click
@@ -235,3 +235,9 @@ Remove that marker to resume notifications. `recheck.py disable` turns off futur
 assessments and their notifications; an active run may finish. Manual review still works.
 See [the synthetic Mac proof](docs/review-proof.md) for orchestrator-only commands. Never use
 real items in that proof, publish private files, or put them in repository logs.
+
+
+Synthetic proof sessions use `review.py --no-copy`. The generated proof folder also has a
+`.review-no-copy` marker: sessions opened through the notification and `--retry-copies` are
+therefore prevented from sending synthetic corrections, even when the real key is installed.
+The page and save result explicitly report that copying is disabled.

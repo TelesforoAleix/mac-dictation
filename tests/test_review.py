@@ -1,5 +1,6 @@
 """Only generated sentences and silence; never inspect owner data."""
 import http.client
+import io
 import json
 from pathlib import Path
 import socket
@@ -7,7 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import wave
 
 import review as r
@@ -138,6 +139,64 @@ class ReviewTests(unittest.TestCase):
         for path in (self.path.parent / 'correction-copies').rglob('*'):
             self.assertFalse(path.stat().st_mode & 0o077)
 
+    def test_audio_mime_wav_head_and_browser_ranges(self):
+        server, _ = self.start(idle=3)
+        def fetch(method='GET', headers=None):
+            connection = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=3)
+            connection.request(method, '/' + server.token + '/audio/0', headers=headers or {})
+            response = connection.getresponse()
+            body = response.read()
+            result = response.status, dict(response.getheaders()), body
+            connection.close()
+            return result
+        status, headers, data = fetch()
+        self.assertEqual((status, headers['Content-Type'], headers['Accept-Ranges']),
+                         (200, 'audio/wav', 'bytes'))
+        with wave.open(io.BytesIO(data)) as audio:
+            self.assertEqual(audio.getnframes(), 2000)
+            self.assertEqual(audio.getframerate(), 8000)
+        status, headers, body = fetch('HEAD')
+        self.assertEqual((status, body, int(headers['Content-Length'])), (200, b'', len(data)))
+        for requested, first, last in [('bytes=0-1', 0, 1), ('bytes=44-', 44, len(data)-1),
+                                       ('bytes=-16', len(data)-16, len(data)-1)]:
+            status, headers, body = fetch(headers={'Range': requested})
+            self.assertEqual(status, 206)
+            self.assertEqual(headers['Content-Type'], 'audio/wav')
+            self.assertEqual(headers['Content-Range'], f'bytes {first}-{last}/{len(data)}')
+            self.assertEqual(body, data[first:last+1])
+        for invalid in ['bytes=-0', 'bytes=99999-', 'bytes=4-2', 'bytes=-', 'bytes=0-1,4-5']:
+            status, headers, _ = fetch(headers={'Range': invalid})
+            self.assertEqual(status, 416)
+            self.assertEqual(headers['Content-Range'], f'bytes */{len(data)}')
+
+    def test_no_copy_flag_and_marker_never_call_sender_even_with_key(self):
+        (self.root / 'dictation-node-key').touch(mode=0o600)
+        for marked in [False, True]:
+            if marked:
+                (self.path.parent / '.review-no-copy').touch(mode=0o600)
+            sender = Mock()
+            server, thread = self.start(idle=3, sender=sender, no_copy=not marked)
+            status, body = self.request(server, 'save', 'POST', self.answers)
+            self.assertEqual(status, 200)
+            self.assertTrue(json.loads(body)['copy_disabled'])
+            self.assertFalse(json.loads(body)['copied'])
+            thread.join(2)
+            sender.assert_not_called()
+            result = json.loads((self.path.parent / 'review-result.json').read_text())
+            self.assertTrue(result['copy_disabled'])
+
+    def test_no_copy_blocks_retry_before_key_or_network(self):
+        for options in [[], ['--no-copy']]:
+            if not options:
+                (self.path.parent / '.review-no-copy').touch(mode=0o600)
+            else:
+                (self.path.parent / '.review-no-copy').unlink()
+            with patch.object(r.sys, 'argv', ['review.py', '--review', str(self.path), '--retry-copies', *options]), \
+                    patch.object(r, 'copy_corrections') as copy:
+                with self.assertRaisesRegex(ValueError, 'copying disabled'):
+                    r.main()
+                copy.assert_not_called()
+
     def test_upload_failure_retains_immutable_retry_batch(self):
         def fail(*args):
             raise OSError('synthetic')
@@ -177,7 +236,17 @@ class ReviewTests(unittest.TestCase):
         source = (self.root / 'review-notification.applescript').read_text()
         self.assertIn('3 dictations to review', source)
         self.assertIn('do shell script', source)
+        self.assertNotIn('argv', source)
+        self.assertNotIn('--args', run.call_args_list[-1].args[0])
+        self.assertTrue((self.root / 'review-notification-request').is_file())
+        notice_branch, click_branch = source.split('else\n')
+        self.assertNotIn('--review', notice_branch)
+        self.assertIn('--review', click_branch)
+        self.assertLess(notice_branch.index('/bin/rm'), notice_branch.index('display notification'))
         self.assertNotIn('flarnet', source)
+        with patch.object(r.recheck, 'run_quiet'):
+            r.notify(self.path, 3, self.root, no_copy=True)
+        self.assertIn('--no-copy', (self.root / 'review-notification.applescript').read_text())
         (self.root / 'review-notifications-disabled').touch()
         with patch.object(r.recheck, 'run_quiet') as run:
             r.notify(self.path, 3, self.root)

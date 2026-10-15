@@ -15,12 +15,43 @@ function diff(left, right) {
   while(i<aa.length && j<bb.length) { if(aa[i]===bb[j]) {keepA.add(i++);keepB.add(j++);} else if(dp[i+1][j]>=dp[i][j+1]) i++; else j++; }
   return [[a,keepA],[b,keepB]].map(([parts,keep]) => { const span=el('span');let n=0;for(const s of parts) span.append(/^\s+$/u.test(s)||keep.has(n++)?document.createTextNode(s):el('mark',s));return span; });
 }
+function playback(card, index) {
+  const audio=el('audio');audio.controls=true;audio.preload='metadata';
+  audio.src=`audio/${index}`;audio.setAttribute('aria-label',`Recording ${index+1}`);
+  const button=el('button','Play recording');button.type='button';
+  const status=el('p','Loading recording…');status.className='playback-status';status.setAttribute('role','status');
+  const progress=el('progress');progress.max=1;progress.value=0;progress.setAttribute('aria-label','Playback progress');
+  let state='Loading';
+  function update(next) {
+    if(next) state=next;
+    const duration=Number.isFinite(audio.duration)?audio.duration:0;
+    const current=Number.isFinite(audio.currentTime)?audio.currentTime:0;
+    progress.max=duration||1;progress.value=current;
+    status.textContent=`${state} — ${current.toFixed(1)} / ${duration.toFixed(1)} seconds`;
+    status.dataset.state=state;
+    button.textContent=audio.paused?'Play recording':'Pause recording';
+  }
+  audio.addEventListener('loadedmetadata',()=>update('Ready'));
+  audio.addEventListener('playing',()=>update('Playing'));
+  audio.addEventListener('timeupdate',()=>{update();if(!audio.paused) activity();});
+  audio.addEventListener('pause',()=>update(audio.ended?'Finished':'Paused'));
+  audio.addEventListener('ended',()=>update('Finished'));
+  audio.addEventListener('waiting',()=>update('Loading'));
+  function failed() {state='Playback failed';status.textContent='Playback failed. Reopen the review and try again.';status.dataset.state=state;}
+  audio.addEventListener('error',failed);
+  button.addEventListener('click',async()=>{
+    if(!audio.paused) {audio.pause();return;}
+    try {if(audio.ended) audio.currentTime=0;update('Loading');await audio.play();} catch {failed();}
+  });
+  card.append(audio,button,progress,status);
+}
+
 async function start() {
   items = (await (await fetch('items')).json()).items;
   items.forEach((item,index) => {
     const card=el('article');card.id=`item-${index}`;
     card.append(el('h2',`${index+1} of ${items.length}`));
-    const audio=el('audio');audio.controls=true;audio.preload='none';audio.src=`audio/${index}`;card.append(audio);
+    playback(card,index);
     const inserted=item.cleaned_text||item.text;
     const [a,b]=diff(inserted,item.recheck);
     card.append(el('h3','Inserted text'));const pa=el('p');pa.append(a);card.append(pa);
@@ -38,7 +69,10 @@ document.querySelector('#done').addEventListener('click',async()=>{
   try {
     const response=await fetch('save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(answers)});
     if(!response.ok) throw new Error();const saved=await response.json();
-    result.textContent=`Saved. ${saved.instruction} Finder shows the import file. ${saved.copied?'Corrections copied to the node.':'Node copy pending; corrections are safe locally. Run the retry command in the README.'} The review server has closed; you can close this tab.`;
+    for(const audio of box.querySelectorAll('audio')) {audio.pause();audio.controls=false;audio.removeAttribute('src');audio.load();}
+    for(const control of box.querySelectorAll('button,input,textarea')) control.disabled=true;
+    for(const status of box.querySelectorAll('.playback-status')) status.textContent='Review saved — playback is closed.';
+    result.textContent=`Saved. ${saved.instruction} Finder shows the import file. ${saved.copy_disabled?'Node copying disabled for this review.':saved.copied?'Corrections copied to the node.':'Node copy pending; corrections are safe locally. Run the retry command in the README.'} The review server has closed; you can close this tab.`;
   } catch {result.textContent='Could not save. The server may have timed out. Reopen the review command and try again.';button.disabled=false;}
 });
 start().catch(()=>{document.querySelector('#result').textContent='Review unavailable. Reopen the review command.';document.querySelector('#done').disabled=true;});

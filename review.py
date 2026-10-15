@@ -153,7 +153,11 @@ def copy_corrections(batch, root):
     recheck.send(batch, key)
 
 
-def save(review, value, answers, root, sender=copy_corrections):
+def copies_disabled(review, no_copy=False):
+    return no_copy or (review.parent / '.review-no-copy').exists()
+
+
+def save(review, value, answers, root, sender=copy_corrections, no_copy=False):
     records = corrections(value['items'], answers)
     # Immutable submission names support additive rsync and explicit retries.
     identifier = uuid.uuid4().hex
@@ -163,22 +167,25 @@ def save(review, value, answers, root, sender=copy_corrections):
     archive = review.parent / 'Imports' / ('VoiceInk-' + identifier + '.json')
     private_json(archive, proposals(value['items'], records))
     copied = False
-    try:
-        sender(batch, root)
-        copied = True
-    except Exception:
-        pass  # Private immutable submission remains available for retry.
+    disabled = copies_disabled(review, no_copy)
+    if not disabled:
+        try:
+            sender(batch, root)
+            copied = True
+        except Exception:
+            pass  # Private immutable submission remains available for retry.
     private_json(review.parent / 'review-result.json',
-                 {'version': 1, 'submission': identifier, 'copied': copied,
+                 {'version': 1, 'submission': identifier, 'copied': copied, 'copy_disabled': disabled,
                   'import_file': str(archive.relative_to(review.parent))})
     return archive, copied
 
 
 class ReviewServer(HTTPServer):
-    def __init__(self, review, root=PRIVATE, idle=300, open_files=True, sender=copy_corrections):
+    def __init__(self, review, root=PRIVATE, idle=300, open_files=True, sender=copy_corrections, no_copy=False):
         self.review = Path(review)
         self.value = load_review(self.review)
         self.root, self.idle, self.open_files, self.sender = root, idle, open_files, sender
+        self.no_copy = copies_disabled(self.review, no_copy)
         self.token = secrets.token_urlsafe(32)
         self.finished = False
         self.last_activity = time.monotonic()
@@ -219,7 +226,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
         self.end_headers()
-        self.wfile.write(data)
+        if self.command != 'HEAD':
+            self.wfile.write(data)
 
     def route(self):
         expected = f'127.0.0.1:{self.server.server_port}'
@@ -230,6 +238,9 @@ class Handler(BaseHTTPRequestHandler):
         if not path.startswith(prefix):
             return None
         return path[len(prefix):]
+
+    def do_HEAD(self):
+        self.do_GET()
 
     def do_GET(self):
         route = self.route()
@@ -253,13 +264,16 @@ class Handler(BaseHTTPRequestHandler):
                 headers = {'Accept-Ranges': 'bytes'}
                 requested = self.headers.get('Range')
                 if requested:
-                    match = re.fullmatch(r'bytes=(\d+)-(\d*)', requested)
-                    if not match:
-                        return self.reply(416)
-                    first = int(match[1])
-                    last = min(int(match[2]) if match[2] else len(data) - 1, len(data) - 1)
+                    match = re.fullmatch(r'bytes=(\d*)-(\d*)', requested)
+                    if not match or not any(match.groups()):
+                        return self.reply(416, extra={'Content-Range': f'bytes */{len(data)}'})
+                    if match[1]:
+                        first = int(match[1])
+                        last = min(int(match[2]) if match[2] else len(data) - 1, len(data) - 1)
+                    else:
+                        first, last = max(0, len(data) - int(match[2])), len(data) - 1
                     if first > last:
-                        return self.reply(416)
+                        return self.reply(416, extra={'Content-Range': f'bytes */{len(data)}'})
                     headers['Content-Range'] = f'bytes {first}-{last}/{len(data)}'
                     return self.reply(206, data[first:last + 1], 'audio/wav', headers)
                 return self.reply(200, data, 'audio/wav', headers)
@@ -282,7 +296,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError()
             answers = json.loads(self.rfile.read(length))
             archive, copied = save(self.server.review, self.server.value, answers,
-                                   self.server.root, self.server.sender)
+                                   self.server.root, self.server.sender, self.server.no_copy)
         except (ValueError, KeyError, TypeError, OSError):
             return self.reply(400, b'{"error":"Could not save; check choices and private storage."}')
         self.server.finished = True
@@ -292,7 +306,7 @@ class Handler(BaseHTTPRequestHandler):
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except OSError:
                 pass  # Saved import still has a private, known location.
-        self.reply(200, json.dumps({'saved': True, 'copied': copied,
+        self.reply(200, json.dumps({'saved': True, 'copied': copied, 'copy_disabled': self.server.no_copy,
                                    'instruction': 'VoiceInk → Dictionary → Import. Choose Merge.',
                                    'import_file': str(archive.relative_to(self.server.review.parent))}).encode())
 
@@ -301,16 +315,31 @@ def applescript_string(text):
     return '"' + text.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
-def notify(review, count, root=PRIVATE):
+def notify(review, count, root=PRIVATE, no_copy=False):
     """Compile a script app: notification clicks relaunch its no-argument handler."""
     if not count or (root / 'review-notifications-disabled').exists():
         return
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     app = root / 'Weekly Dictation Review.app'
     command = shlex.join([sys.executable, str(Path(__file__).resolve()), '--review', str(review)])
+    if copies_disabled(review, no_copy):
+        command += ' --no-copy'
     command += ' >/dev/null 2>&1 &'
-    script = ('on run argv\n'
-              'if (count of argv) > 0 then\n'
+    # LaunchServices does not reliably pass --args to an AppleScript run handler.
+    # Consume a one-shot private marker before displaying the notice. Only a later
+    # launch (the notification click) may open the browser; no argv inference.
+    request = root / 'review-notification-request'
+    request_command = shlex.join(['/bin/rm', '-f', str(request)])
+    script = ('on run\n'
+              'set noticeRequested to false\n'
+              'try\n'
+              f'set requestFile to (POSIX file {applescript_string(str(request))}) as alias\n'
+              'set noticeRequested to true\n'
+              'on error number -43\n'
+              'set noticeRequested to false\n'
+              'end try\n'
+              'if noticeRequested then\n'
+              f'do shell script {applescript_string(request_command)}\n'
               f'display notification {applescript_string(str(count) + " dictations to review")} '
               'with title "Weekly dictation review"\n'
               'else\n'
@@ -325,7 +354,9 @@ def notify(review, count, root=PRIVATE):
     for member in [app, *app.rglob('*')]:
         mode = member.stat().st_mode
         member.chmod(0o700 if member.is_dir() or mode & 0o111 else 0o600)
-    recheck.run_quiet(['/usr/bin/open', '-a', str(app), '--args', '--notify'])
+    request.touch(mode=0o600)
+    request.chmod(0o600)
+    recheck.run_quiet(['/usr/bin/open', '-n', '-a', str(app)])
 
 
 def main():
@@ -335,6 +366,7 @@ def main():
     parser.add_argument('--no-open', action='store_true', help='No browser or Finder (scripted proof)')
     parser.add_argument('--session', type=Path, help='Write private endpoint metadata for scripted proof')
     parser.add_argument('--retry-copies', action='store_true')
+    parser.add_argument('--no-copy', action='store_true', help='Disable all node copying for this session')
     args = parser.parse_args()
     os.umask(0o077)
     if not 0 < args.idle <= 3600:
@@ -349,6 +381,8 @@ def main():
         os.chmod(review.parent / 'review.lock', 0o600)
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if args.retry_copies:
+            if copies_disabled(review, args.no_copy):
+                raise ValueError('Node copying disabled for this review')
             for batch in sorted((review.parent / 'correction-copies').glob('*')):
                 copy_corrections(batch, PRIVATE)
             result_path = review.parent / 'review-result.json'
@@ -358,9 +392,9 @@ def main():
                 private_json(result_path, result)
             print('Correction copies complete.')
             return
-        server = ReviewServer(review, idle=args.idle, open_files=not args.no_open)
+        server = ReviewServer(review, idle=args.idle, open_files=not args.no_open, no_copy=args.no_copy)
         if args.session:
-            private_json(args.session, {'url': server.url, 'pid': os.getpid()})
+            private_json(args.session, {'url': server.url, 'pid': os.getpid(), 'copy_disabled': server.no_copy})
         try:
             if not args.no_open:
                 recheck.run_quiet(['/usr/bin/open', server.url])
