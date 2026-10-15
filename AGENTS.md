@@ -5,7 +5,8 @@ Never put recordings, transcripts, vocabulary, replacements, the owner's own pro
 exported settings, models, or anything read from the owner's VoiceInk data in this repository, even in tests
 or examples. The generic cleanup prompt in cleanup-prompt.txt is allowed.
 Scripts write settings and never print private settings.
-Never touch VoiceInk's SwiftData stores, Recordings, WhisperModels, or the Keychain.
+Read VoiceInk's SwiftData stores only from a snapshot copy; never write to the originals.
+Never touch VoiceInk's Recordings, WhisperModels, or the Keychain.
 Do not include account names, owner home-directory paths, hostnames, or addresses; use `$HOME`.
 
 Work arrives as self-contained task prompts. Run shellcheck on every script and

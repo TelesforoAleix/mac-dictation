@@ -99,15 +99,47 @@ To update, pass an upstream commit hash, rebuild, and reapply settings:
 
 The settings schema is verified at the default commit; inspect a newer commit's setting definitions before using this settings script with a changed schema. Local builds have no trial restriction, iCloud dictionary sync, or automatic updates. The validated arm64 build is ad hoc signed with no team identifier; the script leaves upstream's signing selection unchanged.
 
-To restore preferences, quit VoiceInk, run the exact `defaults import com.prakashjoshipax.VoiceInk` command printed by `settings.sh` with its backup filename, and reopen `/Applications/VoiceInk.app`. Backups contain private preferences: keep them outside version control. The domain backup does not restore macOS's Fn action or login registration; restore those in System Settings and VoiceInk if desired. Scripts never touch VoiceInk's SwiftData stores, recordings, model directory, or Keychain.
+To restore preferences, quit VoiceInk, run the exact `defaults import com.prakashjoshipax.VoiceInk` command printed by `settings.sh` with its backup filename, and reopen `/Applications/VoiceInk.app`. Backups contain private preferences: keep them outside version control. The domain backup does not restore macOS's Fn action or login registration; restore those in System Settings and VoiceInk if desired. The weekly re-check reads a temporary snapshot of the history store and reads recordings; it never writes to VoiceInk's files. Other scripts leave the stores, recordings, model directory and Keychain untouched.
 
 ## Repository checks
 
 Before every commit:
 
 ```bash
-shellcheck build.sh settings.sh cleanup-server.sh check-no-data.sh
+git ls-files -z '*.sh' | xargs -0 shellcheck
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 bash check-no-data.sh
 ```
 
-CI runs ShellCheck on every tracked shell script, the no-data-files guard, and Gitleaks with full Git history. The guard rejects tracked audio, JSON, CSV, plist, store/SQLite, and model files, and any file larger than 256 KiB. It checks tracked files only; ignore rules also keep the upstream clone and build output out of Git. These guards cannot identify all personal content in otherwise allowed text files: review every staged diff. GitHub secret scanning and push protection are enabled. Protected `main` requires the strict `check` job, including for administrators, and disallows force pushes and deletions.
+CI runs ShellCheck on every tracked shell script, the no-data-files guard, and Gitleaks with full Git history. The guard rejects tracked audio, JSON/JSONL, private keys, Python bytecode, CSV, plist, store/SQLite, and model files, and any file larger than 256 KiB. It checks tracked files only; ignore rules also keep the upstream clone and build output out of Git. These guards cannot identify all personal content in otherwise allowed text files: review every staged diff. GitHub secret scanning and push protection are enabled. Protected `main` requires the strict `check` job, including for administrators, and disallows force pushes and deletions.
+
+## Weekly re-check and node copy
+
+[Weekly setup and recovery](docs/weekly-recheck.md) covers the Mac commands, repeatable node
+setup, file formats and validation. The job re-transcribes new recordings with local Whisper
+large-v3 through Homebrew whisper.cpp (Metal, Auto). It compares normalized raw Whisper text
+with the re-check and keeps up to 20 disagreements, largest first. Raw and cleaned text are
+both retained for review. A later slice supplies the review page.
+
+The first run processes the existing history; subsequent runs process unseen completed,
+failed or canceled entries, including entries completed after an earlier snapshot. Each run
+copies new recordings and a JSON-lines history file to the node's existing encrypted weekly
+backup source. Copies use `--ignore-existing`, with no deletion. VoiceInk keeps its originals
+on the Mac. The snapshot is a plain copy of the store and WAL/SHM sidecars; SQLite opens only
+the copy, checks integrity, retries once after 10 seconds on failure, then skips without
+advancing state if the second copy fails.
+
+Reviews, state, staging, the dedicated key and optional count-only logs stay under
+`$HOME/Library/Application Support/mac-dictation/` (0700), outside this public repository.
+The profile job slot schedules Sunday at 03:00 local time, subject to the existing allowed-job,
+AC-power and idle checks. The job never changes profiles.
+
+To turn it off (including any already pending scheduled run):
+
+```bash
+/opt/homebrew/bin/python3 "$HOME/Code/mac-dictation/recheck.py" disable
+```
+
+Use `enable` to resume, or `status` to print only enabled state, review existence and counts.
+Disabling does not remove recordings, reviews, backups, the model, or the key. A run already
+in progress is allowed to finish.
