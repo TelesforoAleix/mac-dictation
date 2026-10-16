@@ -12,9 +12,8 @@ commit=$(git -C "$repo_dir" rev-parse --verify HEAD)
 git -C "$repo_dir" merge-base --is-ancestor "$commit" refs/remotes/origin/main || fail 'Checkout commit is not contained in origin/main; nothing installed.'
 [[ -z $(git -C "$repo_dir" status --porcelain --untracked-files=all) ]] || fail 'Checkout must be clean; nothing installed.'
 
-# Single install list: add the review page and any local imports here when merged.
-# recheck.py currently imports only the Python standard library.
-files=(recheck.py)
+# Single install list: runtime modules, sibling page assets, and synthetic proof CLI.
+files=(recheck.py review.py review.html review.css review.js review-proof.py)
 python3 - "$repo_dir" "$commit" "${files[@]}" <<'PY'
 import json
 import os

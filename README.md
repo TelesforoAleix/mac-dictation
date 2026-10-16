@@ -119,7 +119,7 @@ CI runs ShellCheck on every tracked shell script, the no-data-files guard, and G
 setup, file formats and validation. The job loads its model once per run and re-transcribes new recordings with local Whisper
 large-v3 through Homebrew whisper.cpp (Metal, Auto). It compares normalized raw Whisper text
 with the re-check and keeps up to 20 disagreements, largest first. Raw and cleaned text are
-both retained for review. A later slice supplies the review page.
+both retained for review. The local review page lets you listen and settle each disagreement.
 
 The first run processes the existing history; subsequent runs process unseen completed,
 failed or canceled entries, including entries completed after an earlier snapshot. Each run
@@ -161,3 +161,89 @@ To turn it off (including any already pending scheduled run):
 Use `enable` to resume, or `status` to print only enabled state, review existence and counts.
 Disabling does not remove recordings, reviews, backups, the model, or the key. A run already
 in progress is allowed to finish.
+
+
+## Five-minute weekly review
+
+When a weekly run finishes with items, **Weekly Dictation Review** posts a count-only
+notification. Install/update the tools from merged `main` using `./install-tools.sh` as above.
+Its single inventory includes `recheck.py`, `review.py`, the HTML/CSS/JavaScript assets, and
+`review-proof.py`. The installed job imports its sibling review module; notification callbacks
+launch that installed `review.py`, and the page reads its sibling installed assets. No runtime
+path points at the worktree. Click the notification, or open the latest batch by hand:
+
+```bash
+/opt/homebrew/bin/python3 "$HOME/Library/Application Support/mac-dictation/bin/review.py"
+```
+
+Use **Play recording** (or the audio controls), compare the highlighted words, then choose **Inserted was right**,
+**Re-check was right**, or type the correct text (prefilled with the re-check). Skipping is
+allowed. Playback shows Playing/Paused/Finished, elapsed time and a progress bar even for silent audio. Playback is available while the review server is open. The page preserves W1's order and limit of 20. Inserted text shows the cleaned text
+when available, with the original Whisper text alongside it; the stored text remains an
+insertion proxy rather than a delivery receipt.
+
+**Done** saves every choice privately, builds a VoiceInk dictionary JSON file, and reveals it
+in Finder. In **VoiceInk → Dictionary → Import**, select that file and use **Merge**. Review
+VoiceInk's preview before importing. Nothing is applied automatically. VoiceInk skips duplicate
+vocabulary and duplicate or conflicting replacement sources in Merge mode; Replace would
+remove existing entries and is not the intended workflow. An all-skipped or inserted-right
+batch can produce an empty archive; there is then nothing to import.
+
+Vocabulary proposals are changed words in confirmed corrections compared with the original
+Whisper text. A replacement requires the same changed phrase in two distinct items, with no
+conflicting correction or confirmed correct use. Changed spans are limited to four words per
+side for replacements; punctuation-only and capitalization-only differences create no proposals.
+These are conservative suggestions, not certainty; confirm them in VoiceInk's preview.
+
+The server binds only `127.0.0.1` on a random port with an unguessable session URL. It exits
+on Done, tab closure, or five minutes without activity. Closing or timing out before Done
+discards unsaved choices. Do not share the session URL. There are no external page resources
+or packages. Requests require the expected Host; saving also requires a same-origin JSON POST.
+
+Files stay below the batch's private `rechecks/<run-id>/` folder (directories 0700, files 0600):
+
+- `correction-copies/<submission>/corrections/<submission>.json`: version 1, run ID, and one
+  `{id, choice, text}` record per item; skipped text is null.
+- `Imports/VoiceInk-<submission>.json`: VoiceInk version-1 dictionary archive; Finder reveals it.
+- `review-result.json`: the latest submission, relative import path and node-copy outcome.
+
+Every Done creates an immutable submission. Its corrections use W1's dedicated write-only
+key and `rsync -rt --ignore-existing` mechanism; import files are not sent. Failed copies remain
+locally, with a notice on the page. Retry all saved submissions in the latest batch with:
+
+```bash
+/opt/homebrew/bin/python3 "$HOME/Library/Application Support/mac-dictation/bin/review.py" --retry-copies
+```
+
+For an older batch, add `--review "$HOME/Library/Application Support/mac-dictation/rechecks/<run-id>/review.json"`.
+The write-only key cannot verify remote contents; its admission and live upload proof remain
+W1 prerequisites. No files are automatically deleted from either destination.
+
+The notification hook compiles a local AppleScript app under the private folder with macOS's
+`osacompile`, gives it the stable bundle identifier `org.mac-dictation.review`, and re-signs it ad hoc after updating `Info.plist`. It verifies the signature before launching the app to consume a one-use private notification marker and post the count. That first launch does not open a page. Clicking the notification subsequently runs that app's
+review handler, as described by [Apple's notification documentation](https://developer.apple.com/library/archive/documentation/LanguagesUtilities/Conceptual/MacAutomationScriptingGuide/DisplayNotifications.html).
+No developer signing identity or third-party notifier is used. On the first notification,
+macOS asks the owner once for permission to notify as **Weekly Dictation Review**. Choose
+**Allow**, then rerun the notification if the first attempt was suppressed. If notifications
+were denied, enable them in System Settings → Notifications → Weekly Dictation Review. GUI delivery and click
+behavior require the orchestrator's Mac proof; scheduled execution must reach the logged-in
+user's GUI session. A notification failure preserves W1's completed batch and prints a fixed
+instruction to run the review manually.
+
+To silence review notifications while keeping weekly assessments, create the private marker:
+
+```bash
+umask 077
+touch "$HOME/Library/Application Support/mac-dictation/review-notifications-disabled"
+```
+
+Remove that marker to resume notifications. `recheck.py disable` turns off future weekly
+assessments and their notifications; an active run may finish. Manual review still works.
+See [the synthetic Mac proof](docs/review-proof.md) for orchestrator-only commands. Never use
+real items in that proof, publish private files, or put them in repository logs.
+
+
+Synthetic proof sessions use `review.py --no-copy`. The generated proof folder also has a
+`.review-no-copy` marker: sessions opened through the notification and `--retry-copies` are
+therefore prevented from sending synthetic corrections, even when the real key is installed.
+The page and save result explicitly report that copying is disabled.

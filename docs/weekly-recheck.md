@@ -107,10 +107,10 @@ git pull --ff-only origin main
 The installer fetches `origin/main` and refuses tracked, staged or untracked changes,
 or a checkout commit not contained in `origin/main`. A clean ancestor is permitted;
 use the commands above to install the latest main. Git and Python 3 are required.
-The single `files` list in `install-tools.sh` owns the install inventory; extend it
-with the review page and any local imports when that slice merges. Currently
-`recheck.py` uses only standard-library imports. Files are exported from the exact
-commit and installed under `$HOME/Library/Application Support/mac-dictation/bin/`
+The single `files` list in `install-tools.sh` owns the install inventory: the weekly job,
+review module and HTML/CSS/JavaScript assets, plus the synthetic proof CLI.
+The Python tools use only the standard library and sibling installed modules. Files are
+exported from the exact commit and installed under `$HOME/Library/Application Support/mac-dictation/bin/`
 (0700), with files and `install.json` (0600). The stamp contains `commit`, the full
 Git commit ID. The installer prints that ID, never private settings or data.
 It replaces only listed code and the stamp; the model, key, state and private

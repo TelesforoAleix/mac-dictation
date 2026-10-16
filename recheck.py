@@ -304,6 +304,12 @@ def execute(root=PRIVATE, voice=VOICEINK):
                                'processed_ids': sorted(set(state['processed_ids']) | set(transaction['ids'])),
                                'latest_run': transaction['run_id']})
         pending.unlink()
+        if transaction['items']:
+            try:
+                from review import notify
+                notify(run_dir / 'review.json', transaction['items'], root)
+            except Exception:
+                print('Review notification unavailable; run review.py by hand.')
         print('History rows: {rows}; recordings: {recordings}; unreadable: {unreadable}; '
               'review items: {items}; copy complete.'
               .format(**dict(transaction, unreadable=transaction.get('unreadable', 0))))
