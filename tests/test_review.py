@@ -70,6 +70,74 @@ class ReviewTests(unittest.TestCase):
         self.value['items'][0]['recheck'] = 'THE FLARNET is ready!'
         self.assertEqual(r.proposals(self.value['items'][:1], r.corrections(self.value['items'][:1], self.answers[:1]))['vocabulary'], [])
 
+    def test_noise_is_own_choice_with_optional_note_and_no_learning(self):
+        self.answers = [dict(id=str(i), choice='noise', note='synthetic note',
+                             text='synthetic ignored text') for i in range(3)]
+        records = r.corrections(self.value['items'], self.answers)
+        self.assertEqual(records[0], dict(id='0', choice='noise', text=None, note='synthetic note'))
+        proposals = r.proposals(self.value['items'], records)
+        self.assertEqual((proposals['vocabulary'], proposals['replacements']), ([], []))
+        self.answers[0].pop('note')
+        self.assertEqual(r.corrections(self.value['items'], self.answers)[0]['note'], '')
+        for note in (None, 'x' * 501):
+            self.answers[0]['note'] = note
+            with self.assertRaisesRegex(ValueError, 'noise note'):
+                r.corrections(self.value['items'], self.answers)
+        self.answers[0]['note'] = ''
+        sent = []
+        archive, _ = r.save(self.path, self.value, self.answers, self.root,
+                            lambda batch, root: sent.append(batch))
+        payload = json.loads(next(sent[0].glob('corrections/*.json')).read_text())
+        self.assertEqual(payload['items'][0]['choice'], 'noise')
+        self.assertIsNone(payload['items'][0]['text'])
+        self.assertEqual(json.loads(archive.read_text())['vocabulary'], [])
+
+    def test_noise_does_not_enter_conflicting_evidence_check(self):
+        self.answers[2].update(choice='noise', note='synthetic')
+        archive = r.proposals(self.value['items'], r.corrections(self.value['items'], self.answers))
+        self.assertEqual(archive['replacements'], [{'sources': ['flarnet'], 'replacement': 'clarinet'}])
+
+    def test_superseding_blocks_learning_import_and_retry_then_copies_revocations(self):
+        # First submission represents the synthetic, now obsolete review.
+        archive, _ = r.save(self.path, self.value, self.answers, self.root, lambda *args: None)
+        run = self.path.parent
+        old_path = next((run / 'correction-copies').glob('*/corrections/*.json'))
+        old_id = old_path.stem
+        original_remote_copy = old_path.read_bytes()
+        self.assertEqual(len(list(r.active_corrections(run))), 1)
+        with patch.object(r.recheck, 'send') as send:
+            r.supersede_corrections(run)
+            r.supersede_corrections(run)  # Repeatable after interruptions.
+        send.assert_not_called()
+        self.assertFalse(archive.exists())
+        self.assertEqual(list(r.active_corrections(run)), [])
+        self.assertTrue(json.loads(old_path.read_text())['superseded'])
+        self.assertTrue(json.loads((run / 'review-result.json').read_text())['superseded'])
+        with patch.object(r.recheck, 'send') as send:
+            with self.assertRaisesRegex(ValueError, 'superseded'):
+                r.copy_corrections(old_path.parent.parent, self.root)
+            with patch.object(r.sys, 'argv', ['review.py', '--review', str(self.path), '--retry-copies']), \
+                    patch('builtins.print'):
+                r.main()
+        send.assert_not_called()
+        self.assertTrue(json.loads((run / 'review-result.json').read_text())['superseded'])
+        sent = []
+        new_archive, _ = r.save(self.path, self.value, self.answers, self.root,
+                                lambda batch, root: sent.append(batch))
+        self.assertTrue(new_archive.exists())
+        active = list(r.active_corrections(run))
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]['supersedes'], [old_id])
+        self.assertTrue((sent[0] / 'supersessions' / (old_id + '.json')).exists())
+        # Model an additive restored node copy: old bytes never change remotely.
+        restored = self.root / 'synthetic-restored-backup'
+        r.private_json(restored / 'corrections' / (old_id + '.json'), json.loads(original_remote_copy))
+        new_payload = next(sent[0].glob('corrections/*.json'))
+        r.private_json(restored / 'corrections' / new_payload.name, json.loads(new_payload.read_text()))
+        self.assertEqual(list(r.active_corrections(restored)), active)
+        for path in (run / 'supersessions').glob('*'):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
     def test_invalid_choice_or_identity_rejected_before_writing(self):
         for answers in [[], [dict(id='bad', choice='recheck')] * 3,
                         [dict(id=str(i), choice='bad') for i in range(3)]]:

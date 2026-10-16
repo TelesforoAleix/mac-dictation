@@ -158,7 +158,7 @@ To turn it off (including any already pending scheduled run):
 /opt/homebrew/bin/python3 "$HOME/Library/Application Support/mac-dictation/bin/recheck.py" disable
 ```
 
-Use `enable` to resume, or `status` to print only enabled state, review existence and counts.
+Use `enable` to resume, or `status` to print only assessment, exclusion, loop and flagged-item counts.
 Disabling does not remove recordings, reviews, backups, the model, or the key. A run already
 in progress is allowed to finish.
 
@@ -177,8 +177,9 @@ path points at the worktree. Click the notification, or open the latest batch by
 ```
 
 Use **Play recording** (or the audio controls), compare the highlighted words, then choose **Inserted was right**,
-**Re-check was right**, or type the correct text (prefilled with the re-check). Skipping is
-allowed. Playback shows Playing/Paused/Finished, elapsed time and a progress bar even for silent audio. Playback is available while the review server is open. The page preserves W1's order and limit of 20. Inserted text shows the cleaned text
+**Re-check was right**, type the correct text (prefilled with the re-check), or choose
+**Noise / not a dictation** with an optional short note. Noise choices and notes never
+produce vocabulary or replacements. Skipping is allowed. Playback shows Playing/Paused/Finished, elapsed time and a progress bar even for silent audio. Playback is available while the review server is open. The page preserves W1's order and limit of 20. Inserted text shows the cleaned text
 when available, with the original Whisper text alongside it; the stored text remains an
 insertion proxy rather than a delivery receipt.
 
@@ -203,11 +204,12 @@ or packages. Requests require the expected Host; saving also requires a same-ori
 Files stay below the batch's private `rechecks/<run-id>/` folder (directories 0700, files 0600):
 
 - `correction-copies/<submission>/corrections/<submission>.json`: version 1, run ID, and one
-  `{id, choice, text}` record per item; skipped text is null.
+  `{id, choice, text}` record per item; skipped/noise text is null. Noise also has an optional
+  `note` (at most 500 characters); `supersedes` lists revoked submission IDs.
 - `Imports/VoiceInk-<submission>.json`: VoiceInk version-1 dictionary archive; Finder reveals it.
 - `review-result.json`: the latest submission, relative import path and node-copy outcome.
 
-Every Done creates an immutable submission. Its corrections use W1's dedicated write-only
+Every Done creates a new submission. Its corrections use W1's dedicated write-only
 key and `rsync -rt --ignore-existing` mechanism; import files are not sent. Failed copies remain
 locally, with a notice on the page. Retry all saved submissions in the latest batch with:
 
@@ -217,7 +219,10 @@ locally, with a notice on the page. Retry all saved submissions in the latest ba
 
 For an older batch, add `--review "$HOME/Library/Application Support/mac-dictation/rechecks/<run-id>/review.json"`.
 The write-only key cannot verify remote contents; its admission and live upload proof remain
-W1 prerequisites. No files are automatically deleted from either destination.
+W1 prerequisites. Re-assessment removes superseded generated local imports; node files are never deleted.
+See [re-assessment and superseding](docs/weekly-recheck.md#re-assess-the-latest-copied-batch-and-supersede-its-old-corrections)
+for the supported replacement workflow. Learning consumers must use `review.active_corrections`
+and honor supersession records; raw node correction files are backups, not current learning input.
 
 The notification hook compiles a local AppleScript app under the private folder with macOS's
 `osacompile`, gives it the stable bundle identifier `org.mac-dictation.review`, and re-signs it ad hoc after updating `Info.plist`. It verifies the signature before launching the app to consume a one-use private notification marker and post the count. That first launch does not open a page. Clicking the notification subsequently runs that app's

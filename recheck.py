@@ -2,6 +2,7 @@
 """Weekly private VoiceInk snapshot, large-v3 assessment and additive backup."""
 import contextlib
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+import urllib.request
 from urllib.parse import unquote, urlsplit
 import uuid
 import wave
@@ -23,7 +25,11 @@ APPLE_EPOCH = 978307200
 PRIVATE = Path.home() / 'Library/Application Support/mac-dictation'
 VOICEINK = Path.home() / 'Library/Application Support/com.prakashjoshipax.VoiceInk'
 NODE = 'dictation-backup@homelab-agent'
-# SwiftData's Core Data mapping of Transcription at c09cc1f. No other entity is read.
+VAD_NAME = 'ggml-silero-v5.1.2.bin'
+VAD_SHA256 = '29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf'
+VAD_URL = ('https://huggingface.co/ggml-org/whisper-vad/resolve/'
+           'e5614ed76a5dd4b03fad5068c89efcd2617a9d1e/' + VAD_NAME)
+# SwiftData's Core Data mapping of Transcription at c09cc1f.
 REQUIRED = {'Z_PK': 'INTEGER', 'Z_ENT': 'INTEGER', 'Z_OPT': 'INTEGER',
             'ZID': 'BLOB', 'ZTEXT': 'VARCHAR', 'ZENHANCEDTEXT': 'VARCHAR',
             'ZTIMESTAMP': 'TIMESTAMP', 'ZDURATION': 'FLOAT',
@@ -76,6 +82,58 @@ def copy_snapshot(source, snapshot):
         except FileNotFoundError:
             # A sidecar may disappear on checkpoint/close. Integrity is checked below.
             pass
+
+
+def snapshot_vocabulary(source, temporary_root):
+    """Only VocabularyWord.word is read, and only from a disposable file copy."""
+    for attempt in range(2):
+        try:
+            with tempfile.TemporaryDirectory(prefix='dictionary-', dir=temporary_root) as directory:
+                snapshot = Path(directory) / 'dictionary.sqlite'
+                copy_snapshot(source, snapshot)
+                with contextlib.closing(sqlite3.connect(snapshot.as_uri() + '?mode=ro', uri=True)) as db:
+                    db.execute('PRAGMA query_only=ON')
+                    if db.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+                        raise sqlite3.DatabaseError('Snapshot integrity check failed')
+                    columns = {r[1]: r[2].upper() for r in db.execute('PRAGMA table_info(ZVOCABULARYWORD)')}
+                    required = {'Z_PK': 'INTEGER', 'Z_ENT': 'INTEGER', 'Z_OPT': 'INTEGER',
+                                'ZWORD': 'VARCHAR', 'ZDATEADDED': 'TIMESTAMP'}
+                    if columns != required:
+                        raise SafeError('VoiceInk dictionary layout differs from c09cc1f; nothing processed.')
+                    entities = db.execute("SELECT Z_ENT FROM Z_PRIMARYKEY WHERE Z_NAME='VocabularyWord'").fetchall()
+                    if len(entities) != 1:
+                        raise SafeError('VoiceInk dictionary entity differs from c09cc1f; nothing processed.')
+                    words = [r[0] for r in db.execute(
+                        'SELECT ZWORD FROM ZVOCABULARYWORD WHERE Z_ENT=? ORDER BY ZWORD', entities[0])]
+                    if not all(isinstance(word, str) and '\0' not in word for word in words):
+                        raise SafeError('VoiceInk vocabulary layout differs from c09cc1f; nothing processed.')
+                    return 'Important Vocabulary: ' + ', '.join(words) if words else ''
+        except sqlite3.DatabaseError:
+            if attempt == 0:
+                time.sleep(10)
+            else:
+                raise SafeError('Dictionary snapshot failed twice; state unchanged.') from None
+
+
+def verify_vad(path):
+    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != VAD_SHA256:
+        raise SafeError('VAD model missing or hash mismatch; run download-vad first.')
+
+
+def download_vad(root=PRIVATE):
+    os.umask(0o077)
+    models = root / 'models'
+    models.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target = models / VAD_NAME
+    if not target.exists():
+        with tempfile.TemporaryDirectory(prefix='vad-', dir=models) as directory:
+            staged = Path(directory) / VAD_NAME
+            with urllib.request.urlopen(VAD_URL, timeout=60) as response, staged.open('wb') as stream:
+                shutil.copyfileobj(response, stream)
+            verify_vad(staged)
+            staged.replace(target)
+    verify_vad(target)
+    print('VAD model verified.')
 
 
 def snapshot_rows(source, temporary_root):
@@ -152,12 +210,31 @@ def rank(items):
                   key=lambda i: (-i['score'], i['id']))[:20]
 
 
-def assess_batch(entries, work, model, cli):
+def looping(text):
+    """Discard any normalized 1..64-word phrase repeated at least three times consecutively."""
+    words = normalize(text)
+    for size in range(1, min(64, len(words) // 3) + 1):
+        for start in range(len(words) - 3 * size + 1):
+            phrase = words[start:start + size]
+            if phrase == words[start + size:start + 2 * size] == words[start + 2 * size:start + 3 * size]:
+                return True
+    return False
+
+
+def assess_batch(entries, work, model, cli, vocabulary=''):
     """One model load; only audio-read failures may be skipped."""
-    args = [str(cli), '-m', str(model), '-l', 'auto', '-otxt']
+    # 1.9.5 has no CLI no-context switch. max-context=0 also disables the
+    # initial prompt, so retain default context to preserve vocabulary conditioning.
+    args = [str(cli), '-m', str(model), '-l', 'auto', '-otxt',
+            '--vad', '--vad-model', str(model.parent / VAD_NAME)]
+    if vocabulary:
+        args.extend(['--prompt', vocabulary])
     candidates = []
-    unreadable = 0
+    counts = dict(unreadable=0, excluded_cancelled=0, excluded_silent=0, loops_discarded=0)
     for index, (row, audio) in enumerate(entries):
+        if row.get('status') == 'canceled':
+            counts['excluded_cancelled'] += 1
+            continue
         # Avoid loading Whisper at all for valid WAV headers with zero frames.
         try:
             with wave.open(str(audio), 'rb') as wav:
@@ -165,13 +242,13 @@ def assess_batch(entries, work, model, cli):
         except (wave.Error, EOFError):
             empty = False  # Let Whisper handle formats Python's wave cannot decode.
         if empty:
-            unreadable += 1
+            counts['unreadable'] += 1
             continue
         output = work / str(index)
         candidates.append((row, audio, output.with_suffix('.txt')))
         args.extend(['-f', str(audio), '-of', str(output)])
     if not candidates:
-        return [], unreadable
+        return [], counts
     # stderr is examined only in memory and never printed or saved. stdout can
     # contain transcribed text, so discard it. Metal remains enabled by default.
     result = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -182,13 +259,19 @@ def assess_batch(entries, work, model, cli):
     for row, audio, output in candidates:
         read_error = ("error: failed to read audio file '" + str(audio) + "'").encode()
         if read_error in result.stderr:
-            unreadable += 1
+            counts['unreadable'] += 1
             read_failures += 1
             output.unlink(missing_ok=True)
             continue
         if not output.is_file():
             raise SafeError('Whisper output missing; no upload started (output suppressed).')
         recheck = output.read_text(encoding='utf-8').strip()
+        if not recheck:
+            counts['excluded_silent'] += 1
+            continue
+        if looping(recheck):
+            counts['loops_discarded'] += 1
+            continue
         reviews.append(dict(row, recording='recordings/' + audio.name, recheck=recheck,
                             score=disagreement(row['text'], recheck)))
     # Exit 11 also covers output-write failures. Do not silently classify those as bad audio.
@@ -196,10 +279,10 @@ def assess_batch(entries, work, model, cli):
     if ((result.returncode == 11 and (not failures or int(failures[-1]) != read_failures))
             or (result.returncode == 0 and read_failures)):
         raise SafeError('Whisper batch failed; no upload started (output suppressed).')
-    return reviews, unreadable
+    return reviews, counts
 
 
-def build_run(selected, root, recordings, run_id, pending):
+def build_run(selected, root, recordings, run_id, pending, vocabulary=''):
     building = root / 'recheck-building'
     if building.exists():
         shutil.rmtree(building)  # Incomplete staging from an interrupted pre-upload build.
@@ -208,6 +291,7 @@ def build_run(selected, root, recordings, run_id, pending):
     cli = Path('/opt/homebrew/bin/whisper-cli')
     if not model.is_file() or not cli.is_file():
         raise SafeError('Install Homebrew whisper.cpp and move large-v3 first; see docs.')
+    verify_vad(model.parent / VAD_NAME)
     try:
         (batch / 'recordings').mkdir(parents=True, mode=0o700)
         (batch / 'history').mkdir(mode=0o700)
@@ -225,7 +309,9 @@ def build_run(selected, root, recordings, run_id, pending):
             del value['audio_url']
             history.append(value)
         with tempfile.TemporaryDirectory(prefix='assessment-', dir=root) as directory:
-            reviews, unreadable = assess_batch(entries, Path(directory), model, cli)
+            reviews, counts = assess_batch(entries, Path(directory), model, cli, vocabulary)
+        # Include canceled history with no associated recording in the exclusion count.
+        counts['excluded_cancelled'] = sum(r['status'] == 'canceled' for r in selected)
         for item in reviews:
             del item['audio_url']
         with (batch / 'history' / (run_id + '.jsonl')).open('w', encoding='utf-8') as stream:
@@ -235,7 +321,7 @@ def build_run(selected, root, recordings, run_id, pending):
         write_json(building / 'review.json', {'version': 1, 'run_id': run_id, 'items': items})
         summary = {'version': 1, 'run_id': run_id, 'rows': len(selected),
                    'recordings': len(entries), 'assessed': len(reviews),
-                   'unreadable': unreadable, 'items': len(items)}
+                   **counts, 'items': len(items)}
         write_json(building / 'summary.json', summary)
         # Persist the transaction BEFORE moving staging to its final run folder.
         # A crash between these steps is resumed by execute(), never ignored.
@@ -266,6 +352,76 @@ def send(batch, key):
                '--', str(batch) + '/', NODE + ':./'])
 
 
+def latest_run(root):
+    state = json.loads((root / 'recheck-state.json').read_text())
+    run_id = state['latest_run']
+    if not re.fullmatch(r'[0-9a-f]{32}', run_id):
+        raise SafeError('Invalid latest run identifier.')
+    return root / 'rechecks' / run_id
+
+
+def reassess(root=PRIVATE, voice=VOICEINK):
+    """Assess only saved copies; never upload or modify the processed ledger."""
+    os.umask(0o077)
+    with (root / 'recheck.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SafeError('Weekly re-check already running.') from None
+        if (root / 'recheck-pending.json').exists():
+            raise SafeError('Pending weekly copy; finish it before re-assessment.')
+        run = latest_run(root)
+        # The review server uses the same lock for every review in this batch.
+        with (run / 'review.lock').open('a') as review_lock:
+            try:
+                fcntl.flock(review_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise SafeError('Close the current review before re-assessment.') from None
+            model = root / 'models/ggml-large-v3.bin'
+            cli = Path('/opt/homebrew/bin/whisper-cli')
+            if not model.is_file() or not cli.is_file():
+                raise SafeError('Install Homebrew whisper.cpp and move large-v3 first; see docs.')
+            verify_vad(model.parent / VAD_NAME)
+            vocabulary = snapshot_vocabulary(voice / 'dictionary.store', root)
+            history = run / 'upload/history' / (run.name + '.jsonl')
+            rows = [json.loads(line) for line in history.read_text().splitlines()]
+            entries = []
+            for row in rows:
+                if row['recording']:
+                    relative = Path(row['recording'])
+                    if relative.parts != ('recordings', relative.name):
+                        raise SafeError('Invalid copied recording path.')
+                    audio = recording_path((run / 'upload' / relative).as_uri(), run / 'upload/recordings')
+                    entries.append((row, audio))
+            with tempfile.TemporaryDirectory(prefix='assessment-', dir=root) as directory:
+                reviews, counts = assess_batch(entries, Path(directory), model, cli, vocabulary)
+            counts['excluded_cancelled'] = sum(r['status'] == 'canceled' for r in rows)
+            items = rank(reviews)
+            from review import supersede_corrections, private_json
+            # Assessment must succeed before invalidating any previous submissions.
+            supersede_corrections(run)
+            if (run / 'review.json').exists():
+                archived = run / 'superseded-reviews' / (uuid.uuid4().hex + '.json')
+                private_json(archived, json.loads((run / 'review.json').read_text()))
+            write_json(run / 'review.json', {'version': 1, 'run_id': run.name, 'items': items})
+            write_json(run / 'summary.json', dict(version=1, run_id=run.name,
+                       rows=len(rows), recordings=len(entries), assessed=len(reviews), items=len(items), **counts))
+    print('Latest batch re-assessed; no upload; processed state unchanged.')
+
+
+def status(root=PRIVATE):
+    if not (root / 'recheck-state.json').exists():
+        summary = {}
+    else:
+        run = latest_run(root)
+        summary_file = run / 'summary.json'
+        summary = json.loads(summary_file.read_text()) if summary_file.exists() else {}
+    print('Reviewed: {}; excluded as cancelled: {}; excluded as silent: {}; '
+          'loops discarded: {}; items flagged: {}.'
+          .format(*(summary.get(key, 0) for key in
+                    ('assessed', 'excluded_cancelled', 'excluded_silent', 'loops_discarded', 'items'))))
+
+
 def execute(root=PRIVATE, voice=VOICEINK):
     os.umask(0o077)
     if (root / 'recheck-disabled').exists():
@@ -290,7 +446,8 @@ def execute(root=PRIVATE, voice=VOICEINK):
             if not selected:
                 print('New history rows: 0; no upload needed.')
                 return
-            build_run(selected, root, voice / 'Recordings', uuid.uuid4().hex, pending)
+            vocabulary = snapshot_vocabulary(voice / 'dictionary.store', root)
+            build_run(selected, root, voice / 'Recordings', uuid.uuid4().hex, pending, vocabulary)
         transaction = json.loads(pending.read_text())
         run_dir = root / 'rechecks' / transaction['run_id']
         if not run_dir.exists():
@@ -311,23 +468,21 @@ def execute(root=PRIVATE, voice=VOICEINK):
             except Exception:
                 print('Review notification unavailable; run review.py by hand.')
         print('History rows: {rows}; recordings: {recordings}; unreadable: {unreadable}; '
-              'review items: {items}; copy complete.'
-              .format(**dict(transaction, unreadable=transaction.get('unreadable', 0))))
+              'cancelled: {excluded_cancelled}; silent: {excluded_silent}; '
+              'loops discarded: {loops_discarded}; review items: {items}; copy complete.'
+              .format(**dict(dict(unreadable=0, excluded_cancelled=0, excluded_silent=0,
+                                  loops_discarded=0), **transaction)))
 
 
 if __name__ == '__main__':
     try:
-        if len(sys.argv) == 2 and sys.argv[1] in ('disable', 'enable', 'status'):
+        if len(sys.argv) == 2 and sys.argv[1] in ('disable', 'enable', 'status', 'download-vad', 'reassess'):
             if sys.argv[1] == 'status':
-                state_file = PRIVATE / 'recheck-state.json'
-                state = json.loads(state_file.read_text()) if state_file.exists() else {}
-                review = PRIVATE / 'rechecks' / state.get('latest_run', 'none') / 'review.json'
-                count = len(json.loads(review.read_text())['items']) if review.exists() else 0
-                summary_file = review.parent / 'summary.json'
-                summary = json.loads(summary_file.read_text()) if summary_file.exists() else {}
-                print('Disabled: {}; review exists: {}; review items: {}; processed rows: {}; unreadable: {}.'
-                      .format((PRIVATE / 'recheck-disabled').exists(), review.exists(), count,
-                              len(state.get('processed_ids', [])), summary.get('unreadable', 0)))
+                status()
+            elif sys.argv[1] == 'download-vad':
+                download_vad()
+            elif sys.argv[1] == 'reassess':
+                reassess()
             else:
                 os.umask(0o077)
                 PRIVATE.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -341,7 +496,7 @@ if __name__ == '__main__':
         elif len(sys.argv) == 1:
             execute()
         else:
-            raise SafeError('Usage: recheck.py [disable|enable|status]')
+            raise SafeError('Usage: recheck.py [disable|enable|status|download-vad|reassess]')
     except SafeError as error:
         print(str(error))
         raise SystemExit(1) from None

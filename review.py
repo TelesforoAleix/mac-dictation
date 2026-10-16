@@ -37,7 +37,7 @@ def proposals(items, records):
     evidence = defaultdict(lambda: defaultdict(set))
     protected = set()
     for item, record in zip(items, records):
-        if record['choice'] == 'skip':
+        if record['choice'] in ('skip', 'noise'):
             continue
         wrong, right = tokens(item['text']), tokens(record['text'])
         if record['choice'] == 'inserted':
@@ -63,7 +63,7 @@ def proposals(items, records):
         # Avoid chains/cycles and rules contradicted by a confirmed unchanged phrase.
         if len(support) >= 2 and target.casefold() not in sources:
             contradicted = any(
-                rec['choice'] != 'skip' and
+                rec['choice'] not in ('skip', 'noise') and
                 (' ' + source + ' ') in (' ' + ' '.join(tokens(rec['text'])).casefold() + ' ')
                 for rec in records)
             if not contradicted:
@@ -140,15 +140,23 @@ def corrections(items, answers):
             text = answer.get('text')
             if not isinstance(text, str) or not text.strip() or len(text) > 100000:
                 raise ValueError('Invalid correction')
-        elif choice == 'skip':
+        elif choice in ('skip', 'noise'):
             text = None
         else:
             raise ValueError('Invalid choice')
-        result.append({'id': item['id'], 'choice': choice, 'text': text})
+        record = {'id': item['id'], 'choice': choice, 'text': text}
+        if choice == 'noise':
+            note = answer.get('note', '')
+            if not isinstance(note, str) or len(note) > 500:
+                raise ValueError('Invalid noise note')
+            record['note'] = note.strip()
+        result.append(record)
     return result
 
 
 def copy_corrections(batch, root):
+    if (batch.parent.parent / 'supersessions' / (batch.name + '.json')).exists():
+        raise ValueError('Submission superseded')
     key = root / 'dictation-node-key'
     if key.stat().st_mode & 0o077:
         raise ValueError('Key is not private')
@@ -159,13 +167,56 @@ def copies_disabled(review, no_copy=False):
     return no_copy or (review.parent / '.review-no-copy').exists()
 
 
+def active_corrections(run):
+    """Filter a private run or a restored node backup; never learn from raw JSON."""
+    superseded = {p.stem for p in (run / 'supersessions').glob('*.json')}
+    paths = sorted((run / 'correction-copies').glob('*/corrections/*.json'))
+    paths += sorted((run / 'corrections').glob('*.json'))
+    # Read all revocations first: file order must not affect learning eligibility.
+    values = [(path, json.loads(path.read_text())) for path in paths]
+    for _, value in values:
+        superseded.update(value.get('supersedes', []))
+    for path, value in values:
+        if path.stem in superseded:
+            continue
+        if not value.get('superseded', False):
+            yield value
+
+
+def supersede_corrections(run):
+    """Local authority first; no network. Tombstones accompany the next submission."""
+    paths = sorted((run / 'correction-copies').glob('*/corrections/*.json'))
+    for path in paths:
+        identifier = path.stem
+        if not re.fullmatch(r'[0-9a-f]{32}', identifier) or path.parent.parent.name != identifier:
+            raise ValueError('Invalid submission identifier')
+        marker = run / 'supersessions' / (identifier + '.json')
+        if not marker.exists():
+            private_json(marker, {'version': 1, 'run_id': run.name, 'submission': identifier,
+                                  'superseded': True, 'reason': 'batch-reassessment'})
+        value = json.loads(path.read_text())
+        value['superseded'] = True
+        private_json(path, value)
+        # Generated, unimported proposals must no longer be offered for import.
+        (run / 'Imports' / ('VoiceInk-' + identifier + '.json')).unlink(missing_ok=True)
+    result = run / 'review-result.json'
+    if result.exists():
+        value = json.loads(result.read_text())
+        value['superseded'] = True
+        private_json(result, value)
+
+
 def save(review, value, answers, root, sender=copy_corrections, no_copy=False):
     records = corrections(value['items'], answers)
     # Immutable submission names support additive rsync and explicit retries.
     identifier = uuid.uuid4().hex
     batch = review.parent / 'correction-copies' / identifier
     output = batch / 'corrections' / (identifier + '.json')
-    private_json(output, {'version': 1, 'run_id': value['run_id'], 'items': records})
+    superseded = sorted(p.stem for p in (review.parent / 'supersessions').glob('*.json'))
+    private_json(output, {'version': 1, 'run_id': value['run_id'], 'items': records,
+                          'supersedes': superseded})
+    for marker in (review.parent / 'supersessions').glob('*.json'):
+        private_json(batch / 'supersessions' / marker.name, json.loads(marker.read_text()))
     archive = review.parent / 'Imports' / ('VoiceInk-' + identifier + '.json')
     private_json(archive, proposals(value['items'], records))
     copied = False
@@ -396,11 +447,14 @@ def main():
             if copies_disabled(review, args.no_copy):
                 raise ValueError('Node copying disabled for this review')
             for batch in sorted((review.parent / 'correction-copies').glob('*')):
+                if (review.parent / 'supersessions' / (batch.name + '.json')).exists():
+                    continue
                 copy_corrections(batch, PRIVATE)
             result_path = review.parent / 'review-result.json'
             if result_path.exists():
                 result = json.loads(result_path.read_text())
-                result['copied'] = True
+                if not result.get('superseded', False):
+                    result['copied'] = True
                 private_json(result_path, result)
             print('Correction copies complete.')
             return

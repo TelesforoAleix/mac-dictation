@@ -57,15 +57,19 @@ async function start() {
     card.append(el('h3','Inserted text'));const pa=el('p');pa.append(a);card.append(pa);
     if(item.cleaned_text && item.cleaned_text!==item.text) card.append(el('h3','Original Whisper text'),el('p',item.text));
     card.append(el('h3','Re-check'));const pb=el('p');pb.append(b);card.append(pb);
-    for(const [value,title] of [['inserted','Inserted was right'],['recheck','Re-check was right'],['typed','Type the correct text'],['skip','Skip']]) {
+    for(const [value,title] of [['inserted','Inserted was right'],['recheck','Re-check was right'],['typed','Type the correct text'],['noise','Noise / not a dictation'],['skip','Skip']]) {
       const label=el('label'),input=el('input');input.type='radio';input.name=`choice-${index}`;input.value=value;input.checked=value==='skip';label.append(input,document.createTextNode(title));card.append(label);
     }
-    const field=el('textarea');field.value=item.recheck;field.setAttribute('aria-label','Correct text');field.addEventListener('input',()=>{card.querySelector('[value="typed"]').checked=true;});card.append(field);box.append(card);
+    const field=el('textarea');field.className='correct-text';field.value=item.recheck;field.setAttribute('aria-label','Correct text');field.addEventListener('input',()=>{card.querySelector('[value="typed"]').checked=true;});card.append(field);
+    const noteLabel=el('label','Optional noise note (up to 500 characters)'),note=el('input');note.type='text';note.className='noise-note';note.maxLength=500;noteLabel.hidden=true;noteLabel.append(note);card.append(noteLabel);
+    function choiceChanged() {const noise=card.querySelector('[value="noise"]').checked;noteLabel.hidden=!noise;field.disabled=noise;}
+    for(const input of card.querySelectorAll('input[type="radio"]')) input.addEventListener('change',choiceChanged);
+    box.append(card);
   });
 }
 document.querySelector('#done').addEventListener('click',async()=>{
   const button=document.querySelector('#done'),result=document.querySelector('#result');button.disabled=true;
-  const answers=items.map((item,i)=>({id:item.id,choice:document.querySelector(`#item-${i} input:checked`).value,text:document.querySelector(`#item-${i} textarea`).value}));
+  const answers=items.map((item,i)=>({id:item.id,choice:document.querySelector(`#item-${i} input:checked`).value,text:document.querySelector(`#item-${i} textarea`).value,note:document.querySelector(`#item-${i} .noise-note`).value}));
   try {
     const response=await fetch('save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(answers)});
     if(!response.ok) throw new Error();const saved=await response.json();
