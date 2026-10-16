@@ -3,7 +3,9 @@ import http.client
 import io
 import json
 from pathlib import Path
+import plistlib
 import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -228,15 +230,57 @@ class ReviewTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             r.copy_corrections(self.root, self.root)
 
+    def test_notification_marker_shell_check_present_and_absent(self):
+        # Spaces, quotes and shell metacharacters must remain literal path characters.
+        marker = self.root / "marker ' $(false)"
+        command = r.marker_check_command(marker)
+        for present in [False, True, False]:
+            if present:
+                marker.touch()
+            else:
+                marker.unlink(missing_ok=True)
+            result = subprocess.run(['/bin/sh', '-c', command], check=True, capture_output=True, text=True)
+            self.assertEqual(result.stdout, 'yes' if present else 'no')
+            self.assertEqual(result.stderr, '')
+
+    def test_notification_signing_failure_prevents_launch(self):
+        app = self.root / 'Weekly Dictation Review.app'
+        (app / 'Contents').mkdir(parents=True)
+        info_path = app / 'Contents/Info.plist'
+        info_path.write_bytes(plistlib.dumps({}))
+        def command(args):
+            if args[0] == '/usr/bin/codesign':
+                # The identity must already be in Info.plist when codesigning starts.
+                self.assertEqual(plistlib.loads(info_path.read_bytes())['CFBundleIdentifier'],
+                                 'org.mac-dictation.review')
+                raise r.recheck.SafeError('Synthetic signing failure')
+        with patch.object(r.recheck, 'run_quiet', side_effect=command) as run:
+            with self.assertRaises(r.recheck.SafeError):
+                r.notify(self.path, 3, self.root)
+        self.assertFalse(any(call.args[0][0] == '/usr/bin/open' for call in run.call_args_list))
+        self.assertFalse((self.root / 'review-notification-request').exists())
+
     def test_notification_compiles_app_with_click_handler_and_count_only(self):
-        (self.root / 'Weekly Dictation Review.app').mkdir()
+        app = self.root / 'Weekly Dictation Review.app'
+        (app / 'Contents').mkdir(parents=True)
+        info_path = app / 'Contents/Info.plist'
+        info_path.write_bytes(plistlib.dumps({'CFBundleName': 'Weekly Dictation Review'}))
         with patch.object(r.recheck, 'run_quiet') as run:
             r.notify(self.path, 3, self.root)
-        self.assertEqual([call.args[0][0] for call in run.call_args_list], ['/usr/bin/osacompile', '/usr/bin/open'])
+        self.assertEqual([call.args[0][0] for call in run.call_args_list], ['/usr/bin/osacompile', '/usr/bin/codesign', '/usr/bin/codesign', '/usr/bin/open'])
+        self.assertEqual(plistlib.loads(info_path.read_bytes()),
+                         {'CFBundleName': 'Weekly Dictation Review', 'CFBundleIdentifier': 'org.mac-dictation.review'})
+        self.assertEqual(run.call_args_list[1].args[0],
+                         ['/usr/bin/codesign', '--force', '--sign', '-', '--identifier', 'org.mac-dictation.review', str(app)])
+        self.assertEqual(run.call_args_list[2].args[0],
+                         ['/usr/bin/codesign', '--verify', '--strict', str(app)])
         source = (self.root / 'review-notification.applescript').read_text()
         self.assertIn('3 dictations to review', source)
         self.assertIn('do shell script', source)
         self.assertNotIn('argv', source)
+        self.assertNotIn('as alias', source)
+        self.assertNotIn('on error number', source)
+        self.assertIn(r.applescript_string(r.marker_check_command(self.root / 'review-notification-request')), source)
         self.assertNotIn('--args', run.call_args_list[-1].args[0])
         self.assertTrue((self.root / 'review-notification-request').is_file())
         notice_branch, click_branch = source.split('else\n')

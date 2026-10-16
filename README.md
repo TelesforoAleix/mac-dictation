@@ -216,10 +216,12 @@ The write-only key cannot verify remote contents; its admission and live upload 
 W1 prerequisites. No files are automatically deleted from either destination.
 
 The notification hook compiles a local AppleScript app under the private folder with macOS's
-`osacompile`, then launches it to consume a one-use private notification marker and post the count. That first launch does not open a page. Clicking the notification subsequently runs that app's
+`osacompile`, gives it the stable bundle identifier `org.mac-dictation.review`, and re-signs it ad hoc after updating `Info.plist`. It verifies the signature before launching the app to consume a one-use private notification marker and post the count. That first launch does not open a page. Clicking the notification subsequently runs that app's
 review handler, as described by [Apple's notification documentation](https://developer.apple.com/library/archive/documentation/LanguagesUtilities/Conceptual/MacAutomationScriptingGuide/DisplayNotifications.html).
-No developer signing identity or third-party notifier is used. Allow notifications for
-**Weekly Dictation Review** in System Settings if macOS requests it. GUI delivery and click
+No developer signing identity or third-party notifier is used. On the first notification,
+macOS asks the owner once for permission to notify as **Weekly Dictation Review**. Choose
+**Allow**, then rerun the notification if the first attempt was suppressed. If notifications
+were denied, enable them in System Settings → Notifications → Weekly Dictation Review. GUI delivery and click
 behavior require the orchestrator's Mac proof; scheduled execution must reach the logged-in
 user's GUI session. A notification failure preserves W1's completed batch and prints a fixed
 instruction to run the review manually.

@@ -148,7 +148,8 @@ def notification_only():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fcntl.flock(lock, fcntl.LOCK_UN)
             time.sleep(.1)
-    print('PASS: notification posted without starting the synthetic review. Now click it.')
+    print('PASS: posting handler completed without starting the synthetic review.')
+    print('Notification visibility is unverified: allow its first-use permission prompt, then confirm it appears before clicking.')
 
 
 def cleanup():

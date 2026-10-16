@@ -21,13 +21,33 @@ python3 review-proof.py notification-only
 ```
 
 Require **3 dictations to review** and **no page opening before a click**. `notification-only`
-requires that the posting app consumed its private marker and did not start a review server.
-Allow notifications for Weekly Dictation Review if macOS requests it. Now click the
+requires only that the posting app consumed its private marker and did not start a review
+server; it cannot verify delivery or visibility. The app now has the stable bundle identifier
+`org.mac-dictation.review`, and its edited bundle is re-signed ad hoc and verified before
+launch. On the first notification macOS asks the owner once for permission to notify as
+**Weekly Dictation Review**. Choose **Allow**. If the first attempt was suppressed, rerun:
+
+```bash
+python3 review-proof.py notify
+python3 review-proof.py notification-only
+```
+
+If permission was previously denied, enable the app in System Settings → Notifications.
+Confirm the notification is actually visible, then click the
 notification. The three-item review must open. **While that review is still open**, press
 **Play recording**: require **Playing**, elapsed time advancing toward **4.0 seconds**, a
 moving progress bar, then **Finished**. Silence is intentional. Verify pause/replay, highlights
 and editing. Report pass/fail only. Do not press Done yet; close the synthetic tab and allow
 its server to exit before the scripted step below (if necessary, wait five minutes).
+
+To inspect the app identity and verify its ad hoc signature independently:
+
+```bash
+/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$proof_dir/Weekly Dictation Review.app/Contents/Info.plist"
+/usr/bin/codesign --verify --strict "$proof_dir/Weekly Dictation Review.app"
+```
+
+Require `org.mac-dictation.review` and signature verification exit 0.
 
 If no click is available, this command exercises the app's later no-marker launch handler;
 it does not substitute for verifying that notification posting itself leaves the page closed:

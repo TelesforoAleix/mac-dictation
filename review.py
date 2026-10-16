@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import secrets
 import shlex
@@ -22,6 +23,7 @@ import uuid
 import recheck
 
 PRIVATE = recheck.PRIVATE
+NOTIFICATION_BUNDLE_ID = 'org.mac-dictation.review'
 WORDS = re.compile(r"[^\W_]+(?:['’][^\W_]+)*", re.UNICODE)
 
 
@@ -315,6 +317,11 @@ def applescript_string(text):
     return '"' + text.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
+def marker_check_command(request):
+    # Both branches succeed: a missing marker is normal, not an AppleScript error.
+    return 'if ' + shlex.join(['/bin/test', '-e', str(request)]) + '; then printf yes; else printf no; fi'
+
+
 def notify(review, count, root=PRIVATE, no_copy=False):
     """Compile a script app: notification clicks relaunch its no-argument handler."""
     if not count or (root / 'review-notifications-disabled').exists():
@@ -331,13 +338,7 @@ def notify(review, count, root=PRIVATE, no_copy=False):
     request = root / 'review-notification-request'
     request_command = shlex.join(['/bin/rm', '-f', str(request)])
     script = ('on run\n'
-              'set noticeRequested to false\n'
-              'try\n'
-              f'set requestFile to (POSIX file {applescript_string(str(request))}) as alias\n'
-              'set noticeRequested to true\n'
-              'on error number -43\n'
-              'set noticeRequested to false\n'
-              'end try\n'
+              f'set noticeRequested to ((do shell script {applescript_string(marker_check_command(request))}) is "yes")\n'
               'if noticeRequested then\n'
               f'do shell script {applescript_string(request_command)}\n'
               f'display notification {applescript_string(str(count) + " dictations to review")} '
@@ -345,15 +346,26 @@ def notify(review, count, root=PRIVATE, no_copy=False):
               'else\n'
               f'do shell script {applescript_string(command)}\n'
               'end if\nend run\n')
-    # No transcript or identifier is embedded in the app, just the private review path.
+    # No dictation text is embedded in the app, just the private review path.
     source = root / 'review-notification.applescript'
     with source.open('w', encoding='utf-8') as stream:
         os.chmod(source, 0o600)
         stream.write(script)
     recheck.run_quiet(['/usr/bin/osacompile', '-o', str(app), str(source)])
+    # osacompile does not supply a notification identity. Set it before sealing
+    # the bundle so Notification Center can register this stable app identity.
+    info_path = app / 'Contents/Info.plist'
+    with info_path.open('rb') as stream:
+        info = plistlib.load(stream)
+    info['CFBundleIdentifier'] = NOTIFICATION_BUNDLE_ID
+    with info_path.open('wb') as stream:
+        plistlib.dump(info, stream)
     for member in [app, *app.rglob('*')]:
         mode = member.stat().st_mode
         member.chmod(0o700 if member.is_dir() or mode & 0o111 else 0o600)
+    recheck.run_quiet(['/usr/bin/codesign', '--force', '--sign', '-',
+                       '--identifier', NOTIFICATION_BUNDLE_ID, str(app)])
+    recheck.run_quiet(['/usr/bin/codesign', '--verify', '--strict', str(app)])
     request.touch(mode=0o600)
     request.chmod(0o600)
     recheck.run_quiet(['/usr/bin/open', '-n', '-a', str(app)])
