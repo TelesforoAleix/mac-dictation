@@ -9,15 +9,18 @@ function diff(left, right) {
   const aa = a.filter(s => !/^\s+$/u.test(s)), bb = b.filter(s => !/^\s+$/u.test(s));
   // Avoid quadratic work for unusually long dictations: mark the whole changed text.
   if (aa.length * bb.length > 1000000) return [el('mark', left), el('mark', right)];
+  const norm=s=>s.normalize('NFKC').toLocaleLowerCase().replace(/[^\p{L}\p{N}\s]/gu,' ').trim();
+  const na=aa.map(norm),nb=bb.map(norm);
   const dp = Array.from({length: aa.length + 1}, () => new Uint16Array(bb.length + 1));
-  for (let i=aa.length-1;i>=0;i--) for(let j=bb.length-1;j>=0;j--) dp[i][j]=aa[i]===bb[j]?1+dp[i+1][j+1]:Math.max(dp[i+1][j],dp[i][j+1]);
+  for (let i=aa.length-1;i>=0;i--) for(let j=bb.length-1;j>=0;j--) dp[i][j]=na[i]===nb[j]?1+dp[i+1][j+1]:Math.max(dp[i+1][j],dp[i][j+1]);
   const keepA = new Set(), keepB = new Set(); let i=0,j=0;
-  while(i<aa.length && j<bb.length) { if(aa[i]===bb[j]) {keepA.add(i++);keepB.add(j++);} else if(dp[i+1][j]>=dp[i][j+1]) i++; else j++; }
+  while(i<aa.length && j<bb.length) { if(na[i]===nb[j]) {keepA.add(i++);keepB.add(j++);} else if(dp[i+1][j]>=dp[i][j+1]) i++; else j++; }
   return [[a,keepA],[b,keepB]].map(([parts,keep]) => { const span=el('span');let n=0;for(const s of parts) span.append(/^\s+$/u.test(s)||keep.has(n++)?document.createTextNode(s):el('mark',s));return span; });
 }
-function playback(card, index) {
+function playback(card, index, item) {
   const audio=el('audio');audio.controls=true;audio.preload='metadata';
-  audio.src=`audio/${index}`;audio.setAttribute('aria-label',`Recording ${index+1}`);
+  const range=item.dictation_id!==undefined?`?start=${Math.max(0,item.start-.35)}&end=${item.end+.35}`:'';
+  audio.src=`audio/${index}${range}`;audio.setAttribute('aria-label',`Recording ${index+1}`);
   const button=el('button','Play recording');button.type='button';
   const status=el('p','Loading recording…');status.className='playback-status';status.setAttribute('role','status');
   const progress=el('progress');progress.max=1;progress.value=0;progress.setAttribute('aria-label','Playback progress');
@@ -51,7 +54,7 @@ async function start() {
   items.forEach((item,index) => {
     const card=el('article');card.id=`item-${index}`;
     card.append(el('h2',`${index+1} of ${items.length}`));
-    playback(card,index);
+    playback(card,index,item);
     const inserted=item.cleaned_text||item.text;
     const [a,b]=diff(inserted,item.recheck);
     card.append(el('h3','Inserted text'));const pa=el('p');pa.append(a);card.append(pa);

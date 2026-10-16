@@ -179,7 +179,7 @@ redirected inside this private directory, never into the repository.
 | `recheck-pending.json` | Durable transaction: run ID, row IDs, time and counts; retained on upload failure |
 | `rechecks/<run-id>/summary.json` | Version 1; rows, recordings, assessed, unreadable, excluded_cancelled, excluded_silent, loops_discarded and items |
 | `recheck-building/` | Pre-upload staging, cleaned on build failure or replaced after interruption |
-| `rechecks/<run-id>/review.json` | Version 1, run ID, `items` in descending score order, maximum 20 |
+| `rechecks/<run-id>/review.json` | Version 1, run ID, `items` in descending score order, maximum 10 sentences |
 | `rechecks/<run-id>/upload/history/<run-id>.jsonl` | One row per selected history entry |
 | `rechecks/<run-id>/upload/recordings/` | Copies of recordings selected in that run |
 | `recheck.lock` | Advisory exclusive lock prevents overlapping runs |
@@ -188,11 +188,17 @@ redirected inside this private directory, never into the repository.
 
 History rows contain `id`, `timestamp` (Unix seconds), `recording` (relative path or
 null), `text`, `cleaned_text` and `status`. No absolute audio URL, request prompts,
-vocabulary or preferences are exported. Review items contain those fields plus
-`recheck` and `score`. A score is normalized word-level Levenshtein distance divided
+vocabulary or preferences are exported. Review items are sentences, with a unique `id` (`dictation_id:sentence_index`),
+`dictation_id`, `sentence_index`, `source_field`, `text_start`/`text_end` character offsets,
+`text` (the inserted sentence), `recheck`, `recording`, `start`/`end` seconds and `score`.
+The offsets refer to the unchanged insertion proxy in the saved history row: nonempty
+`cleaned_text` when available, otherwise `text`. A correction carries these same source
+coordinates and replaces only that span; surrounding sentences and whitespace stay intact.
+An unmatched re-check sentence has an empty insertion span. These are private correction
+records; nothing writes back into VoiceInk. A score is normalized word-level Levenshtein distance divided
 by the longer token count, in [0,1]. NFKC, case folding, punctuation removal and
-whitespace splitting normalize comparison inputs. Comparison uses raw `text`;
-`cleaned_text` is retained alongside it for owner review. This is a disagreement
+whitespace splitting normalize comparison inputs. Comparison uses the inserted sentence (cleaned text when available). Full raw and cleaned
+text remain in the private history copy. This is a disagreement
 ranking, not a correctness judgment. Zero disagreements are omitted. SwiftData
 does not store a delivery receipt, so stored text is the available insertion proxy;
 failed rows retain their status rather than claiming successful insertion. Rows whose
@@ -218,6 +224,38 @@ only when its failed-input count matches confirmed audio-read failures. Model,
 inference and output failures abort the build instead of silently losing assessments.
 Nothing from Whisper's stdout or stderr is printed or saved.
 
+## Sentence review (W1e)
+
+The Sunday schedule produces at most **10 sentence items per weekly batch**, largest
+normalized disagreement first, with deterministic item-ID ties. A dictation may contribute
+several items. Equal sentences never enter the review. The choices, Noise handling, Done,
+private corrections file and import workflow continue to operate on the displayed items.
+Proposals use only each selected sentence; no neighboring text is treated as corrected.
+
+Whisper runs once with `-oj` and supplies segment text and millisecond `offsets` in its
+[timed JSON output](https://github.com/ggml-org/whisper.cpp/blob/d1be6fde11ac6e0407606b4e42fe72d34add8037/examples/cli/cli.cpp#L654).
+Timed JSON is temporary and never uploaded. Sentence punctuation (`.`, `!`, `?`, including
+full-width equivalents) cuts the joined segments, preserving a sentence that crosses
+segment boundaries. Common abbreviated titles and decimals do not cut. A final unfinished
+sentence is retained. Within a segment containing several sentences, character proportions
+estimate each sentence's start/end; these are segment-derived estimates, not word timestamps.
+Without sentence punctuation, the remaining text is one sentence.
+
+A monotone dynamic program aligns the insertion proxy's sentences to the re-check with
+word-edit costs and token-weighted gaps. Missing or extra sentences get an empty counterpart
+instead of shifting all later pairs. When an inserted sentence has no re-check counterpart,
+its adjacent timed sentence supplies approximate playback context. Entire dictations equal
+under normalization are ignored even if punctuation changed the sentence boundaries.
+The same NFKC/case-folded word Levenshtein score ranks each resulting pair.
+
+The page asks the local server for `audio/<item>?start=<seconds>&end=<seconds>`.
+For sentence items the server enforces the saved sentence bounds plus **350 ms** on either
+side, clamps them to the recording, reads only those PCM frames from the staged WAV and
+returns a new valid WAV. Browser byte ranges and HEAD refer to that clipped WAV. Omitting
+the query still returns only that stretch; extending it is rejected. Invalid timing/output
+aborts assessment before superseding the existing review. Existing legacy whole-dictation
+reviews remain readable until `reassess` replaces them with the sentence cut and cap.
+
 ## VAD, vocabulary and unreliable re-checks
 
 Large-v3 remains the second opinion. Every inference uses whisper.cpp's `--vad` and
@@ -234,7 +272,7 @@ The download is verified before installation; existing models are verified witho
 re-downloading. A mismatching existing file is left untouched and causes failure.
 The hash is checked again before every weekly assessment and re-assessment.
 
-VAD with no detected speech produces zero output segments and an empty text file;
+VAD with no detected speech produces zero output segments in the timed JSON;
 these recordings are counted as `excluded_silent`, backed up, and never reviewed.
 Zero-frame WAVs remain classified as `unreadable`. A re-check containing any
 normalized phrase of 1–64 words repeated at least three times consecutively is
@@ -310,9 +348,10 @@ before use (`active_corrections` also accepts its flat `corrections/` and
 backup alone is not a current learning source. No model, history or recording is
 re-uploaded by this procedure.
 
-`status` prints only five counts: reviewed (`assessed`, eligible completed
-re-checks before ranking), excluded as cancelled, excluded as silent, loops discarded,
-and items flagged (positive disagreements, capped at 20). It prints no IDs, paths,
+`status` prints only five counts: sentences reviewed (`assessed`, eligible re-check
+sentences before ranking), excluded as cancelled, excluded as silent, loops discarded,
+and items flagged (positive sentence disagreements, capped at 10). Exclusions still count
+whole recordings/history rows because they are discarded before sentence cutting. It prints no IDs, paths,
 text, notes or settings. Unreadable and missing-audio history are not included in
 reviewed; the detailed private summary retains row/recording/unreadable counts.
 
@@ -358,7 +397,10 @@ batch model loading, pre-upload cleanup, interrupted promotion and upload retry 
 W1d fixtures also cover canceled-row backup/exclusion, a silent WAV with mocked
 empty VAD output, loop rejection, vocabulary argument passing and source hashes,
 verified downloads, re-assessment without upload or state changes, noise choices
-and superseded submissions/imports. GPU inference is a Mac validation step.
+and superseded submissions/imports. W1e fixtures cover an 80-sentence dictation with one differing sentence, multiple differences,
+missing/extra sentences, segment joins and cuts, cleaned insertion scoring, the ten-sentence
+cap, exact correction spans, clipped PCM contents and HTTP time/byte-range confinement.
+GPU inference and real re-assessed counts are Mac validation steps.
 The concurrent-writer test compares all three source hashes immediately after the
 writer's deliberate commit with their hashes after the reader returns: the reader
 must add no changes beyond the test writer's own commit.
