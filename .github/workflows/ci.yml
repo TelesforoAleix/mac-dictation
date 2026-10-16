@@ -13,6 +13,11 @@ jobs:
         run: git ls-files -z '*.sh' | xargs -0 shellcheck
       - name: No data files
         run: bash check-no-data.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Synthetic weekly re-check tests
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
       - uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
