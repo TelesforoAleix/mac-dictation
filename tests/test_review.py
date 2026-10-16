@@ -209,6 +209,30 @@ class ReviewTests(unittest.TestCase):
         for path in (self.path.parent / 'correction-copies').rglob('*'):
             self.assertFalse(path.stat().st_mode & 0o077)
 
+    def test_sentence_endpoint_enforces_time_bounds_before_byte_ranges(self):
+        item = self.value['items'][0]
+        item.update(dictation_id='synthetic', sentence_index=0, source_field='text',
+                    text_start=0, text_end=len(item['text']), start=1, end=2)
+        audio = r.audio_path(self.path, item)
+        frames = b'\x01\x00' * 8000 + b'\x02\x00' * 8000 + b'\x03\x00' * 8000
+        with wave.open(str(audio), 'wb') as wav:
+            wav.setparams((1, 2, 8000, 0, 'NONE', 'not compressed'))
+            wav.writeframes(frames)
+        r.private_json(self.path, self.value)
+        server, _ = self.start(idle=3)
+        route = 'audio/0?start=0.65&end=2.35'
+        status, data = self.request(server, route)
+        self.assertEqual(status, 200)
+        with wave.open(io.BytesIO(data)) as wav:
+            self.assertEqual(wav.getnframes(), 13600)
+            self.assertEqual(wav.readframes(13600), frames[5200 * 2:18800 * 2])
+        status, body = self.request(server, route, headers={'Range': 'bytes=44-'})
+        self.assertEqual((status, body), (206, data[44:]))
+        self.assertEqual(self.request(server, 'audio/0')[1], data)
+        for query in ['start=0&end=3', 'start=nan&end=2', 'start=1&end=2&end=3']:
+            self.assertEqual(self.request(server, 'audio/0?' + query), (404, b''))
+        self.assertEqual(self.request(server, route, method='HEAD'), (200, b''))
+
     def test_audio_mime_wav_head_and_browser_ranges(self):
         server, _ = self.start(idle=3)
         def fetch(method='GET', headers=None):
@@ -343,7 +367,7 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(run.call_args_list[2].args[0],
                          ['/usr/bin/codesign', '--verify', '--strict', str(app)])
         source = (self.root / 'review-notification.applescript').read_text()
-        self.assertIn('3 dictations to review', source)
+        self.assertIn('3 sentences to review', source)
         self.assertIn('do shell script', source)
         self.assertNotIn('argv', source)
         self.assertNotIn('as alias', source)

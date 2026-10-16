@@ -207,7 +207,117 @@ def disagreement(left, right):
 
 def rank(items):
     return sorted((i for i in items if i['score'] > 0),
-                  key=lambda i: (-i['score'], i['id']))[:20]
+                  key=lambda i: (-i['score'], i['id']))[:10]
+
+
+# Keep exact character offsets into the insertion proxy for sentence-only corrections.
+# Decimal points and common abbreviated titles are not sentence boundaries.
+SENTENCE_END = re.compile(r'[.!?。！？]+["”’\')\]]*(?=\s|$)')
+ABBREVIATIONS = {'mr', 'mrs', 'ms', 'dr', 'prof', 'sr', 'jr', 'e.g', 'i.e', 'vs', 'etc'}
+
+
+def sentence_spans(text):
+    spans, start = [], 0
+    for match in SENTENCE_END.finditer(text):
+        before = text[:match.start()].rsplit(None, 1)[-1:] or ['']
+        if match.group() == '.' and before[0].casefold() in ABBREVIATIONS:
+            continue
+        end = match.end()
+        if text[start:end].strip():
+            left = start + len(text[start:end]) - len(text[start:end].lstrip())
+            spans.append((left, end))
+        start = end
+    if text[start:].strip():
+        spans.append((start + len(text[start:]) - len(text[start:].lstrip()), len(text.rstrip())))
+    return spans
+
+
+def timed_sentences(segments):
+    """Join segment fragments before cutting; interpolate cuts inside a segment."""
+    text, ranges = '', []
+    previous = 0
+    for segment in segments:
+        value = segment['text']
+        start, end = segment['offsets']['from'], segment['offsets']['to']
+        if (not isinstance(value, str) or not all(type(t) in (int, float) and math.isfinite(t)
+                for t in (start, end)) or start < previous or end <= start):
+            raise SafeError('Invalid Whisper segment times; no review replaced.')
+        previous = start
+        # Whisper segments normally carry leading spaces; preserve word boundaries otherwise.
+        if text and value and not text[-1].isspace() and not value[0].isspace():
+            text += ' '
+        left = len(text)
+        text += value
+        if value.strip():
+            ranges.append((left, len(text), start / 1000, end / 1000))
+    result = []
+    for left, right in sentence_spans(text):
+        overlaps = [(a, b, start, end) for a, b, start, end in ranges if a < right and b > left]
+        a, b, start, end = overlaps[0]
+        t0 = start + (end - start) * max(0, left - a) / (b - a)
+        a, b, start, end = overlaps[-1]
+        t1 = start + (end - start) * min(b - a, right - a) / (b - a)
+        result.append(dict(text=text[left:right], start=t0, end=t1))
+    return result
+
+
+def align_sentences(inserted, checked):
+    """Monotone minimum word-edit alignment, with explicit missing/extra sentences.
+
+    Token-weighted gap costs keep an omitted sentence from shifting every later pair.
+    Equal whole-text normalization also tolerates punctuation-only resegmentation.
+    """
+    spans = sentence_spans(inserted)
+    if normalize(inserted) == normalize(' '.join(s['text'] for s in checked)):
+        return []
+    left = [inserted[a:b] for a, b in spans]
+    weights_a = [max(1, len(normalize(s))) for s in left]
+    weights_b = [max(1, len(normalize(s['text']))) for s in checked]
+    costs = [[0] * (len(checked) + 1) for _ in range(len(left) + 1)]
+    moves = {}
+    for i in range(1, len(left) + 1):
+        costs[i][0] = costs[i - 1][0] + weights_a[i - 1]
+        moves[i, 0] = (i - 1, 0)
+    for j in range(1, len(checked) + 1):
+        costs[0][j] = costs[0][j - 1] + weights_b[j - 1]
+        moves[0, j] = (0, j - 1)
+    for i in range(1, len(left) + 1):
+        for j in range(1, len(checked) + 1):
+            edits = disagreement(left[i - 1], checked[j - 1]['text']) * max(
+                weights_a[i - 1], weights_b[j - 1])
+            candidates = [(costs[i - 1][j - 1] + edits, i - 1, j - 1),
+                          (costs[i - 1][j] + weights_a[i - 1], i - 1, j),
+                          (costs[i][j - 1] + weights_b[j - 1], i, j - 1)]
+            cost, a, b = min(candidates, key=lambda value: value[0])
+            costs[i][j], moves[i, j] = cost, (a, b)
+    pairs, i, j = [], len(left), len(checked)
+    while i or j:
+        a, b = moves[i, j]
+        # A source-only sentence has no measured speech: use its adjacent segment.
+        timing = checked[j - 1] if j else checked[0]
+        if a < i:
+            start, end = spans[i - 1]
+        else:
+            start = end = spans[i][0] if i < len(spans) else len(inserted)
+        pairs.append(dict(text=inserted[start:end], recheck=checked[j - 1]['text'] if b < j else '',
+                          text_start=start, text_end=end, start=timing['start'], end=timing['end']))
+        i, j = a, b
+    return list(reversed(pairs))
+
+
+def sentence_items(row, audio, checked):
+    inserted = row.get('cleaned_text') or row['text']
+    source_field = 'cleaned_text' if row.get('cleaned_text') else 'text'
+    pairs = align_sentences(inserted, checked)
+    result = []
+    for index, pair in enumerate(pairs):
+        score = disagreement(pair['text'], pair['recheck'])
+        if score == 0:
+            continue
+        result.append(dict(id=row['id'] + ':' + str(index), dictation_id=row['id'],
+                           sentence_index=index, source_field=source_field, **pair,
+                           recording='recordings/' + audio.name, score=score))
+    return result
 
 
 def looping(text):
@@ -225,7 +335,7 @@ def assess_batch(entries, work, model, cli, vocabulary=''):
     """One model load; only audio-read failures may be skipped."""
     # 1.9.5 has no CLI no-context switch. max-context=0 also disables the
     # initial prompt, so retain default context to preserve vocabulary conditioning.
-    args = [str(cli), '-m', str(model), '-l', 'auto', '-otxt',
+    args = [str(cli), '-m', str(model), '-l', 'auto', '-oj',
             '--vad', '--vad-model', str(model.parent / VAD_NAME)]
     if vocabulary:
         args.extend(['--prompt', vocabulary])
@@ -245,7 +355,7 @@ def assess_batch(entries, work, model, cli, vocabulary=''):
             counts['unreadable'] += 1
             continue
         output = work / str(index)
-        candidates.append((row, audio, output.with_suffix('.txt')))
+        candidates.append((row, audio, output.with_suffix('.json')))
         args.extend(['-f', str(audio), '-of', str(output)])
     if not candidates:
         return [], counts
@@ -256,6 +366,7 @@ def assess_batch(entries, work, model, cli, vocabulary=''):
         raise SafeError('Whisper re-check failed; no upload started (output suppressed).')
     reviews = []
     read_failures = 0
+    assessed = 0
     for row, audio, output in candidates:
         read_error = ("error: failed to read audio file '" + str(audio) + "'").encode()
         if read_error in result.stderr:
@@ -265,21 +376,28 @@ def assess_batch(entries, work, model, cli, vocabulary=''):
             continue
         if not output.is_file():
             raise SafeError('Whisper output missing; no upload started (output suppressed).')
-        recheck = output.read_text(encoding='utf-8').strip()
+        try:
+            segments = json.loads(output.read_text(encoding='utf-8'))['transcription']
+            if not isinstance(segments, list):
+                raise ValueError()
+            checked = timed_sentences(segments)
+        except (ValueError, KeyError, TypeError):
+            raise SafeError('Invalid Whisper timed output; no review replaced.') from None
+        recheck = ' '.join(s['text'] for s in checked).strip()
         if not recheck:
             counts['excluded_silent'] += 1
             continue
         if looping(recheck):
             counts['loops_discarded'] += 1
             continue
-        reviews.append(dict(row, recording='recordings/' + audio.name, recheck=recheck,
-                            score=disagreement(row['text'], recheck)))
+        reviews.extend(sentence_items(row, audio, checked))
+        assessed += len(checked)
     # Exit 11 also covers output-write failures. Do not silently classify those as bad audio.
     failures = re.findall(rb'error: (\d+) input file\(s\) failed', result.stderr)
     if ((result.returncode == 11 and (not failures or int(failures[-1]) != read_failures))
             or (result.returncode == 0 and read_failures)):
         raise SafeError('Whisper batch failed; no upload started (output suppressed).')
-    return reviews, counts
+    return reviews, dict(counts, assessed_sentences=assessed)
 
 
 def build_run(selected, root, recordings, run_id, pending, vocabulary=''):
@@ -312,15 +430,13 @@ def build_run(selected, root, recordings, run_id, pending, vocabulary=''):
             reviews, counts = assess_batch(entries, Path(directory), model, cli, vocabulary)
         # Include canceled history with no associated recording in the exclusion count.
         counts['excluded_cancelled'] = sum(r['status'] == 'canceled' for r in selected)
-        for item in reviews:
-            del item['audio_url']
         with (batch / 'history' / (run_id + '.jsonl')).open('w', encoding='utf-8') as stream:
             for row in history:
                 stream.write(json.dumps(row, ensure_ascii=False) + '\n')
         items = rank(reviews)
         write_json(building / 'review.json', {'version': 1, 'run_id': run_id, 'items': items})
         summary = {'version': 1, 'run_id': run_id, 'rows': len(selected),
-                   'recordings': len(entries), 'assessed': len(reviews),
+                   'recordings': len(entries), 'assessed': counts.pop('assessed_sentences', 0),
                    **counts, 'items': len(items)}
         write_json(building / 'summary.json', summary)
         # Persist the transaction BEFORE moving staging to its final run folder.
@@ -405,7 +521,7 @@ def reassess(root=PRIVATE, voice=VOICEINK):
                 private_json(archived, json.loads((run / 'review.json').read_text()))
             write_json(run / 'review.json', {'version': 1, 'run_id': run.name, 'items': items})
             write_json(run / 'summary.json', dict(version=1, run_id=run.name,
-                       rows=len(rows), recordings=len(entries), assessed=len(reviews), items=len(items), **counts))
+                       rows=len(rows), recordings=len(entries), assessed=counts.pop('assessed_sentences', 0), items=len(items), **counts))
     print('Latest batch re-assessed; no upload; processed state unchanged.')
 
 
@@ -416,7 +532,7 @@ def status(root=PRIVATE):
         run = latest_run(root)
         summary_file = run / 'summary.json'
         summary = json.loads(summary_file.read_text()) if summary_file.exists() else {}
-    print('Reviewed: {}; excluded as cancelled: {}; excluded as silent: {}; '
+    print('Sentences reviewed: {}; excluded as cancelled: {}; excluded as silent: {}; '
           'loops discarded: {}; items flagged: {}.'
           .format(*(summary.get(key, 0) for key in
                     ('assessed', 'excluded_cancelled', 'excluded_silent', 'loops_discarded', 'items'))))

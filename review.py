@@ -6,7 +6,9 @@ from datetime import datetime, timezone
 from difflib import SequenceMatcher
 import fcntl
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import io
 import json
+import math
 import os
 from pathlib import Path
 import plistlib
@@ -17,8 +19,9 @@ import subprocess
 import sys
 import tempfile
 import time
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 import uuid
+import wave
 
 import recheck
 
@@ -100,6 +103,8 @@ def load_review(path):
     items = value['items']
     if not isinstance(items, list) or len(items) > 20:
         raise ValueError('Invalid items')
+    if any('dictation_id' in item for item in items) and len(items) > 10:
+        raise ValueError('Too many sentences')
     ids = set()
     for item in items:
         if not all(isinstance(item.get(k), str) for k in ('id', 'text', 'recheck', 'recording')):
@@ -107,6 +112,19 @@ def load_review(path):
         if item['id'] in ids:
             raise ValueError('Duplicate item')
         ids.add(item['id'])
+        if 'dictation_id' in item:
+            for key in ('start', 'end'):
+                if type(item.get(key)) not in (int, float) or not math.isfinite(item[key]):
+                    raise ValueError('Invalid sentence time')
+            if not 0 <= item['start'] < item['end']:
+                raise ValueError('Invalid sentence time')
+            if (not isinstance(item['dictation_id'], str)
+                    or type(item.get('sentence_index')) is not int or item['sentence_index'] < 0
+                    or item.get('source_field') not in ('text', 'cleaned_text')
+                    or type(item.get('text_start')) is not int or type(item.get('text_end')) is not int
+                    or not 0 <= item['text_start'] <= item['text_end']
+                    or item['text_end'] - item['text_start'] != len(item['text'])):
+                raise ValueError('Invalid sentence span')
         audio_path(path, item)
     return value
 
@@ -122,6 +140,39 @@ def audio_path(review, item):
     if audio.is_symlink() or audio.resolve().parent != base or not audio.is_file():
         raise ValueError('Missing recording')
     return audio
+
+
+def audio_clip(review, item, query):
+    """Return a fresh WAV containing only the authorized sentence plus 350ms margin.
+
+    Byte ranges below apply to this new WAV, never the original private recording.
+    Legacy reviews retain full playback until the owner runs reassess.
+    """
+    path = audio_path(review, item)
+    if 'dictation_id' not in item:
+        return path.read_bytes()
+    lower, upper = max(0, item['start'] - .35), item['end'] + .35
+    values = parse_qs(query, strict_parsing=True)
+    if values:
+        if set(values) != {'start', 'end'} or any(len(v) != 1 for v in values.values()):
+            raise ValueError('Invalid time range')
+        start, end = float(values['start'][0]), float(values['end'][0])
+        if not all(math.isfinite(t) for t in (start, end)) or not lower <= start < end <= upper:
+            raise ValueError('Invalid time range')
+    else:
+        start, end = lower, upper
+    with wave.open(str(path), 'rb') as source:
+        rate, frames = source.getframerate(), source.getnframes()
+        first, last = min(frames, math.floor(start * rate)), min(frames, math.ceil(end * rate))
+        if first >= last:
+            raise ValueError('Empty time range')
+        source.setpos(first)
+        data = source.readframes(last - first)
+        buffer = io.BytesIO()
+        with wave.open(buffer, 'wb') as target:
+            target.setparams(source.getparams())
+            target.writeframes(data)
+        return buffer.getvalue()
 
 
 def corrections(items, answers):
@@ -145,6 +196,9 @@ def corrections(items, answers):
         else:
             raise ValueError('Invalid choice')
         record = {'id': item['id'], 'choice': choice, 'text': text}
+        if 'dictation_id' in item:
+            record.update({key: item[key] for key in
+                           ('dictation_id', 'sentence_index', 'source_field', 'text_start', 'text_end')})
         if choice == 'noise':
             note = answer.get('note', '')
             if not isinstance(note, str) or len(note) > 500:
@@ -312,8 +366,8 @@ class Handler(BaseHTTPRequestHandler):
                 index = int(route[6:])
                 if index < 0:
                     raise ValueError()
-                audio = audio_path(self.server.review, self.server.value['items'][index])
-                data = audio.read_bytes()
+                data = audio_clip(self.server.review, self.server.value['items'][index],
+                                  urlsplit(self.path).query)
                 headers = {'Accept-Ranges': 'bytes'}
                 requested = self.headers.get('Range')
                 if requested:
@@ -330,7 +384,7 @@ class Handler(BaseHTTPRequestHandler):
                     headers['Content-Range'] = f'bytes {first}-{last}/{len(data)}'
                     return self.reply(206, data[first:last + 1], 'audio/wav', headers)
                 return self.reply(200, data, 'audio/wav', headers)
-            except (ValueError, IndexError, OSError):
+            except (ValueError, IndexError, OSError, wave.Error, EOFError):
                 return self.reply(404)
         return self.reply(404)
 
@@ -392,7 +446,7 @@ def notify(review, count, root=PRIVATE, no_copy=False):
               f'set noticeRequested to ((do shell script {applescript_string(marker_check_command(request))}) is "yes")\n'
               'if noticeRequested then\n'
               f'do shell script {applescript_string(request_command)}\n'
-              f'display notification {applescript_string(str(count) + " dictations to review")} '
+              f'display notification {applescript_string(str(count) + " sentences to review")} '
               'with title "Weekly dictation review"\n'
               'else\n'
               f'do shell script {applescript_string(command)}\n'

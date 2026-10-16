@@ -117,9 +117,9 @@ CI runs ShellCheck on every tracked shell script, the no-data-files guard, and G
 
 [Weekly setup and recovery](docs/weekly-recheck.md) covers the Mac commands, repeatable node
 setup, file formats and validation. The job loads its model once per run and re-transcribes new recordings with local Whisper
-large-v3 through Homebrew whisper.cpp (Metal, Auto). It compares normalized raw Whisper text
-with the re-check and keeps up to 20 disagreements, largest first. Raw and cleaned text are
-both retained for review. The local review page lets you listen and settle each disagreement.
+large-v3 through Homebrew whisper.cpp (Metal, Auto). It compares inserted sentences (cleaned text when available)
+with the timed re-check and keeps up to 10 differing sentences per weekly batch, largest
+disagreements first. Full raw and cleaned text remain in the private history copy. The local review page lets you listen and settle each disagreement.
 
 The first run processes the existing history; subsequent runs process unseen completed,
 failed or canceled entries, including entries completed after an earlier snapshot. Each run
@@ -179,9 +179,11 @@ path points at the worktree. Click the notification, or open the latest batch by
 Use **Play recording** (or the audio controls), compare the highlighted words, then choose **Inserted was right**,
 **Re-check was right**, type the correct text (prefilled with the re-check), or choose
 **Noise / not a dictation** with an optional short note. Noise choices and notes never
-produce vocabulary or replacements. Skipping is allowed. Playback shows Playing/Paused/Finished, elapsed time and a progress bar even for silent audio. Playback is available while the review server is open. The page preserves W1's order and limit of 20. Inserted text shows the cleaned text
-when available, with the original Whisper text alongside it; the stored text remains an
-insertion proxy rather than a delivery receipt.
+produce vocabulary or replacements. Skipping is allowed. Playback shows Playing/Paused/Finished, elapsed time and a progress bar even for silent audio. Playback is available while the review server is open. The page shows at most 10 sentences, largest disagreements first. Playback serves only the
+sentence stretch with a short margin. Inserted text uses the cleaned text when available;
+stored text remains an insertion proxy rather than a delivery receipt. Corrections identify
+the exact sentence span and leave surrounding text unchanged. Use `reassess` after installing
+to replace the latest batch’s older whole-dictation review without uploading anything.
 
 **Done** saves every choice privately, builds a VoiceInk dictionary JSON file, and reveals it
 in Finder. In **VoiceInk → Dictionary → Import**, select that file and use **Merge**. Review

@@ -13,6 +13,11 @@ import uuid
 import recheck as r
 
 
+def whisper_output(output, text):
+    segments = [dict(text=text, offsets={'from': 0, 'to': 1000})] if text else []
+    Path(str(output) + '.json').write_text(json.dumps({'transcription': segments}))
+
+
 class RecheckTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -158,10 +163,10 @@ class RecheckTests(unittest.TestCase):
         self.assertEqual(r.disagreement('', ''), 0)
         self.assertEqual(r.disagreement('', 'one'), 1)
 
-    def test_top_twenty_descending_positive_only(self):
+    def test_top_ten_descending_positive_only(self):
         items = [dict(id=str(i), score=i / 30) for i in range(30)]
         result = r.rank(items)
-        self.assertEqual(len(result), 20)
+        self.assertEqual(len(result), 10)
         self.assertEqual(result[0]['score'], 29 / 30)
         self.assertEqual(r.rank([dict(id='zero', score=0)]), [])
 
@@ -209,7 +214,7 @@ class RecheckTests(unittest.TestCase):
             return str(path) == '/opt/homebrew/bin/whisper-cli' or original_is_file(path)
 
         def whisper(args, **kwargs):
-            Path(args[args.index('-of') + 1] + '.txt').write_text('synthetic different')
+            whisper_output(args[args.index('-of') + 1], 'synthetic different')
             return subprocess.CompletedProcess(args, 0, stderr=b'')
 
         with patch.object(Path, 'is_file', installed), patch.object(r.subprocess, 'run', side_effect=whisper), \
@@ -223,8 +228,8 @@ class RecheckTests(unittest.TestCase):
         self.assertEqual(len(review['items']), 1)
         item = review['items'][0]
         self.assertEqual(item['recording'], 'recordings/' + audio.name)
-        self.assertEqual(item['text'], 'synthetic')
-        self.assertEqual(item['cleaned_text'], 'synthetic cleaned')
+        self.assertEqual(item['text'], 'synthetic cleaned')
+        self.assertEqual(item['source_field'], 'cleaned_text')
         self.assertNotIn('audio_url', item)
         history = json.loads(next((run / 'upload/history').glob('*.jsonl')).read_text())
         self.assertEqual(history['id'], identifier)
@@ -258,8 +263,8 @@ class RecheckTests(unittest.TestCase):
             self.assertEqual(kwargs['stdout'], subprocess.DEVNULL)
             self.assertEqual(kwargs['stderr'], subprocess.PIPE)
             # whisper-cli opens the output file before decoding each input.
-            Path(outputs[1] + '.txt').touch()
-            Path(outputs[0] + '.txt').write_text('synthetic recheck')
+            Path(outputs[1] + '.json').touch()
+            whisper_output(outputs[0], 'synthetic recheck')
             error = ("error: failed to read audio file '" + str(broken) + "'\n"
                      'error: 1 input file(s) failed\n').encode()
             return subprocess.CompletedProcess(args, 11, stderr=error)
@@ -270,7 +275,7 @@ class RecheckTests(unittest.TestCase):
         run.assert_called_once()
         self.assertEqual(len(reviews), 1)
         self.assertEqual(counts['unreadable'], 2)
-        self.assertFalse((work / '2.txt').exists())
+        self.assertFalse((work / '2.json').exists())
 
     def test_all_empty_audio_skips_cli_entirely(self):
         empty = self.audio_fixture('empty.wav', 0)
@@ -295,7 +300,7 @@ class RecheckTests(unittest.TestCase):
 
         def whisper(args, **kwargs):
             outputs = [args[i + 1] for i, value in enumerate(args) if value == '-of']
-            Path(outputs[0] + '.txt').write_text('synthetic partial output')
+            whisper_output(outputs[0], 'synthetic partial output')
             error = ("error: failed to read audio file '" + str(broken) + "'\n"
                      'error: 2 input file(s) failed\n').encode()
             return subprocess.CompletedProcess(args, 11, stderr=error)
@@ -419,16 +424,16 @@ class RecheckTests(unittest.TestCase):
             self.assertEqual(args[args.index('--prompt') + 1], 'Important Vocabulary: Synthetic')
             outputs = [args[i + 1] for i, value in enumerate(args) if value == '-of']
             self.assertEqual(len(outputs), 3)  # Canceled never enters inference.
-            # Silero returns no segments for the silent WAV, producing an empty txt.
+            # Silero returns no segments for the silent WAV, producing no JSON segments.
             for output, text in zip(outputs, ('', 'synthetic loop ' * 3, 'synthetic changed')):
-                Path(output + '.txt').write_text(text)
+                whisper_output(output, text)
             return subprocess.CompletedProcess(args, 0, stderr=b'')
         with patch.object(r.subprocess, 'run', side_effect=whisper):
             reviews, counts = r.assess_batch(entries, self.root, self.root / 'model', Path('cli'),
                                              'Important Vocabulary: Synthetic')
-        self.assertEqual([i['id'] for i in reviews], ['3'])
+        self.assertEqual([i['id'] for i in reviews], ['3:0'])
         self.assertEqual(counts, dict(unreadable=0, excluded_cancelled=1,
-                                      excluded_silent=1, loops_discarded=1))
+                                      excluded_silent=1, loops_discarded=1, assessed_sentences=1))
 
     def test_reassess_only_copies_preserves_state_upload_and_original_review(self):
         run_id = 'a' * 32
@@ -441,6 +446,8 @@ class RecheckTests(unittest.TestCase):
             name = str(uuid.UUID(int=i)) + '.wav'
             self.audio_fixture(name, 16000).rename(recordings / name)
             rows.append(dict(id=str(i), status=status, recording='recordings/' + name, text='synthetic'))
+        source_sentences = [f'Synthetic object {i} is blue.' for i in range(12)]
+        rows[-1]['text'] = ' '.join(source_sentences)
         (run / 'upload/history' / (run_id + '.jsonl')).write_text(
             '\n'.join(json.dumps(row) for row in rows))
         state = self.root / 'recheck-state.json'
@@ -461,8 +468,9 @@ class RecheckTests(unittest.TestCase):
         self.assertFalse((run / 'supersessions').exists())
         def whisper(args, **kwargs):
             outputs = [args[i + 1] for i, value in enumerate(args) if value == '-of']
-            for output, text in zip(outputs, ('', 'synthetic loop ' * 3, 'synthetic changed')):
-                Path(output + '.txt').write_text(text)
+            for output, text in zip(outputs, ('', 'synthetic loop ' * 3,
+                                              ' '.join(source_sentences).replace('blue', 'green'))):
+                whisper_output(output, text)
             return subprocess.CompletedProcess(args, 0, stderr=b'')
         with patch.object(Path, 'is_file', return_value=True), \
                 patch.object(r.subprocess, 'run', side_effect=whisper), \
@@ -477,13 +485,13 @@ class RecheckTests(unittest.TestCase):
         self.assertFalse(old_archive.exists())
         self.assertTrue(json.loads(old_payload.read_text())['superseded'])
         self.assertEqual(list(review.active_corrections(run)), [])
-        self.assertEqual(len(json.loads((run / 'review.json').read_text())['items']), 1)
+        self.assertEqual(len(json.loads((run / 'review.json').read_text())['items']), 10)
         self.assertEqual(json.loads(next((run / 'superseded-reviews').glob('*.json')).read_text()),
                          json.loads(before[run / 'review.json']))
         with patch('builtins.print') as printed:
             r.status(self.root)
-        printed.assert_called_once_with('Reviewed: 1; excluded as cancelled: 1; excluded as silent: 1; '
-                                        'loops discarded: 1; items flagged: 1.')
+        printed.assert_called_once_with('Sentences reviewed: 12; excluded as cancelled: 1; excluded as silent: 1; '
+                                        'loops discarded: 1; items flagged: 10.')
 
     def test_cancelled_rows_backed_up_and_never_assessed(self):
         identifier = self.add(status='canceled')
