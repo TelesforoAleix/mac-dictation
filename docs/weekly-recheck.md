@@ -144,6 +144,7 @@ from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
 import sys
 
+sys.dont_write_bytecode = True
 profile_path = Path.home() / 'Code/homelab-v2/mac/homelab-profile'
 loader = SourceFileLoader('homelab_profile', str(profile_path))
 spec = spec_from_loader(loader.name, loader)
