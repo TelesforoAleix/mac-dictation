@@ -139,12 +139,14 @@ atomic save. No LaunchAgent reload is required because the agent invokes the sta
 
 ```bash
 /opt/homebrew/bin/python3 - <<'PY'
-from importlib.util import module_from_spec, spec_from_file_location
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
 from pathlib import Path
 import sys
 
 profile_path = Path.home() / 'Code/homelab-v2/mac/homelab-profile'
-spec = spec_from_file_location('homelab_profile', profile_path)
+loader = SourceFileLoader('homelab_profile', str(profile_path))
+spec = spec_from_loader(loader.name, loader)
 profile = module_from_spec(spec)
 sys.modules[spec.name] = profile
 spec.loader.exec_module(profile)
