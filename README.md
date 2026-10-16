@@ -147,9 +147,9 @@ git pull --ff-only origin main
 The installer fetches `origin/main`, refuses dirty or unmerged commits, and copies
 its single code inventory into `$HOME/Library/Application Support/mac-dictation/bin/`
 (0700). `bin/install.json` records the full installed commit. Re-run after updates;
-branch switches do not alter installed code. Existing job migration requires a
-supported command-update/removal interface in `homelab-profile`; the inspected
-version has none. See the [migration blocker and verification steps](docs/weekly-recheck.md#install-and-update-the-job-code).
+branch switches do not alter installed code. To replace an existing job command,
+use `homelab-profile job remove` and then `job add`, preserving its calendar as
+shown in the [migration and verification steps](docs/weekly-recheck.md#install-and-update-the-job-code).
 Do not edit the profile slot's state file.
 
 To turn it off (including any already pending scheduled run):

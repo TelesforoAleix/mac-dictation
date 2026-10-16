@@ -128,17 +128,23 @@ For a **new, unregistered** job, the slot's registration syntax is:
   /opt/homebrew/bin/python3 "$HOME/Library/Application Support/mac-dictation/bin/recheck.py"
 ```
 
-**Existing registration migration is blocked:** the inspected installed
-`homelab-profile` offers `job list`, `job run` and `job add`, but no remove or
-command-update interface; `add` refuses an existing name. The orchestrator must
-obtain a supported migration interface in that repository before re-pointing
-`dictation-recheck`. Do not edit its saved state or import its internal save helpers.
-The target command is the argument array shown above, retaining the exact Sunday
-03:00 calendar. After migration, use `job list`, select only `dictation-recheck`,
-and assert its command and calendar; do not publish the unfiltered list. Run the
-installed `recheck.py status`, switch this checkout to a different branch, and
-repeat the command/calendar assertion. Return to `main` afterward. Never use
-`job run` for these checks.
+After the owning `homelab-profile` installation supports `job remove`, replace the
+existing registration through that interface. This preserves the Sunday 03:00
+calendar and avoids editing saved profile state:
+
+```bash
+profile="$HOME/Library/Application Support/homelab/mac/homelab-profile"
+installed="$HOME/Library/Application Support/mac-dictation/bin/recheck.py"
+"$profile" job remove dictation-recheck
+"$profile" job add dictation-recheck \
+  --calendar '{"Weekday":0,"Hour":3,"Minute":0}' \
+  /opt/homebrew/bin/python3 "$installed"
+```
+
+Use `job list` to select only `dictation-recheck`, then assert its command and
+calendar; do not publish the unfiltered list. Run the installed `recheck.py status`,
+switch this checkout to a different branch, and repeat the command/calendar
+assertion. Return to `main` afterward. Never use `job run` for these checks.
 
 The profile controller reads `$HOME/.config/homelab/profiles.json`. It permits jobs
 with a per-profile boolean:
