@@ -166,10 +166,14 @@ in progress is allowed to finish.
 ## Five-minute weekly review
 
 When a weekly run finishes with items, **Weekly Dictation Review** posts a count-only
-notification. Click it, or open the latest batch by hand:
+notification. Install/update the tools from merged `main` using `./install-tools.sh` as above.
+Its single inventory includes `recheck.py`, `review.py`, the HTML/CSS/JavaScript assets, and
+`review-proof.py`. The installed job imports its sibling review module; notification callbacks
+launch that installed `review.py`, and the page reads its sibling installed assets. No runtime
+path points at the worktree. Click the notification, or open the latest batch by hand:
 
 ```bash
-/opt/homebrew/bin/python3 "$HOME/Code/mac-dictation/review.py"
+/opt/homebrew/bin/python3 "$HOME/Library/Application Support/mac-dictation/bin/review.py"
 ```
 
 Use **Play recording** (or the audio controls), compare the highlighted words, then choose **Inserted was right**,
@@ -208,7 +212,7 @@ key and `rsync -rt --ignore-existing` mechanism; import files are not sent. Fail
 locally, with a notice on the page. Retry all saved submissions in the latest batch with:
 
 ```bash
-/opt/homebrew/bin/python3 "$HOME/Code/mac-dictation/review.py" --retry-copies
+/opt/homebrew/bin/python3 "$HOME/Library/Application Support/mac-dictation/bin/review.py" --retry-copies
 ```
 
 For an older batch, add `--review "$HOME/Library/Application Support/mac-dictation/rechecks/<run-id>/review.json"`.

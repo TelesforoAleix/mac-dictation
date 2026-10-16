@@ -1,8 +1,15 @@
 # Orchestrator: synthetic W2 proof on the Mac
 
-Run outside the executor sandbox, in the W2 worktree. This proof creates only three generic
-sentences and three four-second silence WAVs. It never reads VoiceInk's files. Do not run the
-weekly assessment for this proof. The owner reviews a real batch later.
+Run outside the executor sandbox, **after W2 is explicitly authorized and merged**. This
+procedure does not authorize a merge: the owner's notification and real-review checks are
+still gates. The installer refuses an unmerged W2 commit; do not bypass that check.
+
+Install from clean `main`, then run the installed synthetic proof CLI. It imports the sibling
+installed review module, whose notification callback launches the installed `review.py` and
+serves the installed HTML/CSS/JavaScript assets. No review worktree is needed at runtime.
+Regenerate the synthetic applet below; do not reuse a notification emitted by the earlier worktree copy.
+This proof creates only three generic sentences and three four-second silence WAVs. It never
+reads VoiceInk's files. Do not run the weekly assessment for this proof.
 
 Close old synthetic review tabs before starting. The guarded cleanup below removes only a
 marked synthetic folder and refuses cleanup while its review lock is held. If a tab was
@@ -11,13 +18,17 @@ abandoned, allow five minutes for its idle timeout first.
 ```bash
 set -e
 umask 077
-cd "$HOME/Code/mac-dictation-w2"
+cd "$HOME/Code/mac-dictation"
+git switch main
+git pull --ff-only origin main
+./install-tools.sh
 export PYTHONDONTWRITEBYTECODE=1
+tools_dir="$HOME/Library/Application Support/mac-dictation/bin"
 proof_dir="$HOME/Library/Application Support/mac-dictation/w2-synthetic-proof"
-if [ -d "$proof_dir" ]; then python3 review-proof.py cleanup; fi
-python3 review-proof.py prepare
-python3 review-proof.py notify
-python3 review-proof.py notification-only
+if [ -d "$proof_dir" ]; then python3 "$tools_dir/review-proof.py" cleanup; fi
+python3 "$tools_dir/review-proof.py" prepare
+python3 "$tools_dir/review-proof.py" notify
+python3 "$tools_dir/review-proof.py" notification-only
 ```
 
 Require **3 dictations to review** and **no page opening before a click**. `notification-only`
@@ -28,8 +39,8 @@ launch. On the first notification macOS asks the owner once for permission to no
 **Weekly Dictation Review**. Choose **Allow**. If the first attempt was suppressed, rerun:
 
 ```bash
-python3 review-proof.py notify
-python3 review-proof.py notification-only
+python3 "$tools_dir/review-proof.py" notify
+python3 "$tools_dir/review-proof.py" notification-only
 ```
 
 If permission was previously denied, enable the app in System Settings → Notifications.
@@ -62,10 +73,10 @@ notification that merely opens Script Editor.
 Run the automated save proof separately, with no browser tab or Finder window:
 
 ```bash
-python3 review.py --review "$proof_dir/review.json" --no-copy --no-open \
+python3 "$tools_dir/review.py" --review "$proof_dir/review.json" --no-copy --no-open \
   --session "$proof_dir/session.json" >"$proof_dir/review.log" 2>&1 &
 review_pid=$!
-python3 review-proof.py check
+python3 "$tools_dir/review-proof.py" check
 wait "$review_pid"
 ```
 
@@ -87,11 +98,11 @@ these submissions. `check` requires `copy_disabled: true` before saving and requ
 Remove generated synthetic files after all synthetic review pages have closed:
 
 ```bash
-python3 review-proof.py cleanup
+python3 "$tools_dir/review-proof.py" cleanup
 ```
 
 Cleanup refuses an existing scripted session and requires both the synthetic marker and
 an available review lock. It removes only the generated local proof folder, including its
 notification app, audio, corrections, import, log and Swift build artifacts. Share only
-count-only output and pass/fail. W2 still waits for W1's merge and the owner's later real
-review/import check.
+count-only output and pass/fail. W1 and W1c have merged; W2 remains unmerged until the
+orchestrator explicitly authorizes it after the required owner checks.
