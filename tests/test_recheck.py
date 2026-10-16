@@ -34,6 +34,18 @@ class RecheckTests(unittest.TestCase):
         self.db.execute('CREATE TABLE Z_PRIMARYKEY (Z_ENT INTEGER, Z_NAME VARCHAR)')
         self.db.execute("INSERT INTO Z_PRIMARYKEY VALUES (1, 'Transcription')")
         self.db.commit()
+        self.dictionary = self.root / 'dictionary.store'
+        self.dictionary_db = sqlite3.connect(self.dictionary)
+        self.addCleanup(self.dictionary_db.close)
+        self.dictionary_db.execute('PRAGMA journal_mode=WAL')
+        self.dictionary_db.execute('CREATE TABLE ZVOCABULARYWORD (Z_PK INTEGER, Z_ENT INTEGER, '
+                                   'Z_OPT INTEGER, ZWORD VARCHAR, ZDATEADDED TIMESTAMP)')
+        self.dictionary_db.execute('CREATE TABLE Z_PRIMARYKEY (Z_ENT INTEGER, Z_NAME VARCHAR)')
+        self.dictionary_db.execute("INSERT INTO Z_PRIMARYKEY VALUES (1, 'VocabularyWord')")
+        self.dictionary_db.commit()
+        self.vad_check = patch.object(r, 'verify_vad')
+        self.vad_check.start()
+        self.addCleanup(self.vad_check.stop)
 
     def add(self, pk=1, status='completed', timestamp=100):
         identifier = uuid.UUID(int=pk)
@@ -253,17 +265,17 @@ class RecheckTests(unittest.TestCase):
             return subprocess.CompletedProcess(args, 11, stderr=error)
 
         with patch.object(r.subprocess, 'run', side_effect=whisper) as run:
-            reviews, unreadable = r.assess_batch([(row, good), (row, empty), (row, broken)],
+            reviews, counts = r.assess_batch([(row, good), (row, empty), (row, broken)],
                                                 work, self.root / 'model', Path('cli'))
         run.assert_called_once()
         self.assertEqual(len(reviews), 1)
-        self.assertEqual(unreadable, 2)
+        self.assertEqual(counts['unreadable'], 2)
         self.assertFalse((work / '2.txt').exists())
 
     def test_all_empty_audio_skips_cli_entirely(self):
         empty = self.audio_fixture('empty.wav', 0)
         with patch.object(r.subprocess, 'run') as run:
-            self.assertEqual(r.assess_batch([({}, empty)], self.root, Path('model'), Path('cli')), ([], 1))
+            self.assertEqual(r.assess_batch([({}, empty)], self.root, Path('model'), Path('cli')), ([], dict(unreadable=1, excluded_cancelled=0, excluded_silent=0, loops_discarded=0)))
         run.assert_not_called()
 
     def test_runtime_failure_and_output_failure_are_fatal(self):
@@ -333,7 +345,7 @@ class RecheckTests(unittest.TestCase):
         self.assertFalse(pending.exists())
         (root / 'recheck-building').mkdir()
         (root / 'recheck-building/stale').touch()
-        with patch.object(Path, 'is_file', return_value=True), patch.object(r, 'assess_batch', return_value=([], 0)):
+        with patch.object(Path, 'is_file', return_value=True), patch.object(r, 'assess_batch', return_value=([], dict(unreadable=0))):
             r.build_run([], root, self.root, 'synthetic', pending)
         self.assertFalse((root / 'recheck-building/stale').exists())
         self.assertTrue(pending.exists())
@@ -358,6 +370,165 @@ class RecheckTests(unittest.TestCase):
         with patch.object(r, 'snapshot_rows') as snapshot, patch('builtins.print'):
             r.execute(self.root, self.root)
         snapshot.assert_not_called()
+
+    def test_dictionary_copy_wal_prompt_and_source_hashes(self):
+        self.dictionary_db.executemany('INSERT INTO ZVOCABULARYWORD VALUES (?,1,1,?,0)',
+                                       [(1, 'Synthetic Zeta'), (2, 'Synthetic Alpha')])
+        self.dictionary_db.commit()
+        def hashes():
+            return [hashlib.sha256(Path(str(self.dictionary) + suffix).read_bytes()).hexdigest()
+                    for suffix in ('', '-wal', '-shm')]
+        before = hashes()
+        connect = r.sqlite3.connect
+        def only_copy(database, *args, **kwargs):
+            self.assertNotIn(self.dictionary.as_uri(), str(database))
+            return connect(database, *args, **kwargs)
+        with patch.object(r.sqlite3, 'connect', side_effect=only_copy):
+            prompt = r.snapshot_vocabulary(self.dictionary, self.root)
+        self.assertEqual(prompt, 'Important Vocabulary: Synthetic Alpha, Synthetic Zeta')
+        self.assertEqual(before, hashes())
+        self.assertFalse(any(self.root.glob('dictionary-*')))
+
+    def test_dictionary_empty_schema_and_torn_snapshot(self):
+        self.assertEqual(r.snapshot_vocabulary(self.dictionary, self.root), '')
+        with patch.object(r, 'copy_snapshot', side_effect=lambda source, target: target.write_bytes(b'torn')), \
+                patch.object(r.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(r.SafeError, 'failed twice'):
+                r.snapshot_vocabulary(self.dictionary, self.root)
+        sleep.assert_called_once_with(10)
+        self.dictionary_db.execute('ALTER TABLE ZVOCABULARYWORD ADD COLUMN ZNEW VARCHAR')
+        self.dictionary_db.commit()
+        with self.assertRaisesRegex(r.SafeError, 'layout differs'):
+            r.snapshot_vocabulary(self.dictionary, self.root)
+
+    def test_loop_rule(self):
+        self.assertTrue(r.looping('A synthetic sentence. A SYNTHETIC sentence! A synthetic sentence.'))
+        self.assertTrue(r.looping('prefix ' + 'synthetic ' * 3 + 'suffix'))
+        self.assertTrue(r.looping((' '.join('synthetic' + str(i) for i in range(64)) + ' ') * 3))
+        self.assertFalse(r.looping('A synthetic sentence. A synthetic sentence.'))
+        self.assertFalse(r.looping('synthetic alpha synthetic beta synthetic gamma'))
+
+    def test_cancelled_silence_loop_and_vocabulary_passing(self):
+        audio = self.audio_fixture('silent.wav', 16000)
+        entries = [(dict(id=str(i), status=status, text='synthetic'), audio)
+                   for i, status in enumerate(('canceled', 'completed', 'completed', 'completed'))]
+        def whisper(args, **kwargs):
+            self.assertIn('--vad', args)
+            self.assertEqual(args[args.index('--vad-model') + 1], str(self.root / r.VAD_NAME))
+            self.assertNotIn('--max-context', args)
+            self.assertEqual(args[args.index('--prompt') + 1], 'Important Vocabulary: Synthetic')
+            outputs = [args[i + 1] for i, value in enumerate(args) if value == '-of']
+            self.assertEqual(len(outputs), 3)  # Canceled never enters inference.
+            # Silero returns no segments for the silent WAV, producing an empty txt.
+            for output, text in zip(outputs, ('', 'synthetic loop ' * 3, 'synthetic changed')):
+                Path(output + '.txt').write_text(text)
+            return subprocess.CompletedProcess(args, 0, stderr=b'')
+        with patch.object(r.subprocess, 'run', side_effect=whisper):
+            reviews, counts = r.assess_batch(entries, self.root, self.root / 'model', Path('cli'),
+                                             'Important Vocabulary: Synthetic')
+        self.assertEqual([i['id'] for i in reviews], ['3'])
+        self.assertEqual(counts, dict(unreadable=0, excluded_cancelled=1,
+                                      excluded_silent=1, loops_discarded=1))
+
+    def test_reassess_only_copies_preserves_state_upload_and_original_review(self):
+        run_id = 'a' * 32
+        run = self.root / 'rechecks' / run_id
+        recordings = run / 'upload/recordings'
+        recordings.mkdir(parents=True)
+        (run / 'upload/history').mkdir()
+        rows = []
+        for i, status in enumerate(('canceled', 'completed', 'completed', 'completed'), 1):
+            name = str(uuid.UUID(int=i)) + '.wav'
+            self.audio_fixture(name, 16000).rename(recordings / name)
+            rows.append(dict(id=str(i), status=status, recording='recordings/' + name, text='synthetic'))
+        (run / 'upload/history' / (run_id + '.jsonl')).write_text(
+            '\n'.join(json.dumps(row) for row in rows))
+        state = self.root / 'recheck-state.json'
+        state.write_text(json.dumps(dict(latest_run=run_id, processed_ids=['synthetic'])))
+        (run / 'review.json').write_text(json.dumps(dict(version=1, run_id=run_id, items=[])))
+        import review
+        old_archive, _ = review.save(run / 'review.json', dict(run_id=run_id, items=[]), [],
+                                     self.root, lambda *args: None)
+        old_payload = next((run / 'correction-copies').glob('*/corrections/*.json'))
+        before = {p: p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
+        # A failed new assessment must not invalidate the current review or imports.
+        with patch.object(Path, 'is_file', return_value=True), \
+                patch.object(r, 'assess_batch', side_effect=r.SafeError('Synthetic inference failure')):
+            with self.assertRaises(r.SafeError):
+                r.reassess(self.root, self.root)
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertFalse((run / 'supersessions').exists())
+        def whisper(args, **kwargs):
+            outputs = [args[i + 1] for i, value in enumerate(args) if value == '-of']
+            for output, text in zip(outputs, ('', 'synthetic loop ' * 3, 'synthetic changed')):
+                Path(output + '.txt').write_text(text)
+            return subprocess.CompletedProcess(args, 0, stderr=b'')
+        with patch.object(Path, 'is_file', return_value=True), \
+                patch.object(r.subprocess, 'run', side_effect=whisper), \
+                patch.object(r, 'send') as send, patch.object(r, 'snapshot_rows') as snapshot, \
+                patch('builtins.print'):
+            r.reassess(self.root, self.root)
+        send.assert_not_called()
+        snapshot.assert_not_called()
+        for path, content in before.items():
+            if path not in (run / 'review.json', old_archive, old_payload, run / 'review-result.json'):
+                self.assertEqual(path.read_bytes(), content)
+        self.assertFalse(old_archive.exists())
+        self.assertTrue(json.loads(old_payload.read_text())['superseded'])
+        self.assertEqual(list(review.active_corrections(run)), [])
+        self.assertEqual(len(json.loads((run / 'review.json').read_text())['items']), 1)
+        self.assertEqual(json.loads(next((run / 'superseded-reviews').glob('*.json')).read_text()),
+                         json.loads(before[run / 'review.json']))
+        with patch('builtins.print') as printed:
+            r.status(self.root)
+        printed.assert_called_once_with('Reviewed: 1; excluded as cancelled: 1; excluded as silent: 1; '
+                                        'loops discarded: 1; items flagged: 1.')
+
+    def test_cancelled_rows_backed_up_and_never_assessed(self):
+        identifier = self.add(status='canceled')
+        recordings = self.root / 'Recordings'
+        recordings.mkdir()
+        audio = self.audio_fixture('cancelled.wav', 16000)
+        audio.rename(recordings / (identifier + '.wav'))
+        target = recordings / (identifier + '.wav')
+        self.db.execute('UPDATE ZTRANSCRIPTION SET ZAUDIOFILEURL=?', (target.as_uri(),))
+        self.db.commit()
+        root = self.root / 'private'
+        (root / 'models').mkdir(parents=True)
+        (root / 'models/ggml-large-v3.bin').touch()
+        (root / 'dictation-node-key').touch(mode=0o600)
+        is_file = Path.is_file
+        with patch.object(Path, 'is_file', lambda path: str(path) == '/opt/homebrew/bin/whisper-cli' or is_file(path)), \
+                patch.object(r.subprocess, 'run') as whisper, patch.object(r, 'send') as send, \
+                patch('builtins.print'):
+            r.execute(root, self.root)
+        whisper.assert_not_called()
+        send.assert_called_once()
+        run = r.latest_run(root)
+        summary = json.loads((run / 'summary.json').read_text())
+        self.assertEqual((summary['excluded_cancelled'], summary['assessed'], summary['items']), (1, 0, 0))
+        self.assertEqual((run / 'upload/recordings' / target.name).read_bytes(), target.read_bytes())
+        history = json.loads(next((run / 'upload/history').glob('*.jsonl')).read_text())
+        self.assertEqual(history['status'], 'canceled')
+
+    def test_vad_download_verifies_before_install_and_existing_file(self):
+        self.vad_check.stop()
+        import io
+        content = b'synthetic model'
+        target = self.root / 'models' / r.VAD_NAME
+        with patch.object(r.urllib.request, 'urlopen', return_value=io.BytesIO(content)), \
+                patch('builtins.print'):
+            with self.assertRaisesRegex(r.SafeError, 'hash mismatch'):
+                r.download_vad(self.root)
+        self.assertFalse(target.exists())
+        with patch.object(r, 'VAD_SHA256', hashlib.sha256(content).hexdigest()), \
+                patch.object(r.urllib.request, 'urlopen', return_value=io.BytesIO(content)) as download, \
+                patch('builtins.print'):
+            r.download_vad(self.root)
+            r.download_vad(self.root)
+        download.assert_called_once()
+        self.assertEqual(target.read_bytes(), content)
 
     def test_failed_upload_retries_saved_batch_before_advancing_state(self):
         self.add()

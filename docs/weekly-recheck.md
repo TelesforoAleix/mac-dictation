@@ -3,8 +3,9 @@
 The source contract is VoiceInk 2.21 at `c09cc1f`. The model in
 `VoiceInk/Infrastructure/Persistence/Models/Transcription.swift` has `id`, `timestamp`,
 `text`, `enhancedText`, `audioFileURL`, duration and status. The recording workflow
-writes UUID-named WAVs into VoiceInk's `Recordings/` directory. No dictionary or
-preferences are queried. The reader validates the SQLite entity and column layout
+writes UUID-named WAVs into VoiceInk's `Recordings/` directory. Vocabulary is read
+from a file copy of `dictionary.store`; preferences are not queried. The reader
+validates the SQLite entity and column layout
 on a temporary snapshot; mismatches stop processing and uploads with a fixed message.
 
 ## Repeatable node setup
@@ -176,7 +177,7 @@ redirected inside this private directory, never into the repository.
 | `bin/install.json` | Public code provenance: full `commit` ID |
 | `recheck-state.json` | Version 1; `last_run` (Unix seconds), `processed_ids`, `latest_run` |
 | `recheck-pending.json` | Durable transaction: run ID, row IDs, time and counts; retained on upload failure |
-| `rechecks/<run-id>/summary.json` | Version 1; counts of rows, recordings, assessed, unreadable and review items |
+| `rechecks/<run-id>/summary.json` | Version 1; rows, recordings, assessed, unreadable, excluded_cancelled, excluded_silent, loops_discarded and items |
 | `recheck-building/` | Pre-upload staging, cleaned on build failure or replaced after interruption |
 | `rechecks/<run-id>/review.json` | Version 1, run ID, `items` in descending score order, maximum 20 |
 | `rechecks/<run-id>/upload/history/<run-id>.jsonl` | One row per selected history entry |
@@ -194,7 +195,9 @@ whitespace splitting normalize comparison inputs. Comparison uses raw `text`;
 `cleaned_text` is retained alongside it for owner review. This is a disagreement
 ranking, not a correctness judgment. Zero disagreements are omitted. SwiftData
 does not store a delivery receipt, so stored text is the available insertion proxy;
-failed/canceled rows retain their status rather than claiming successful insertion.
+failed rows retain their status rather than claiming successful insertion. Rows whose
+status is `canceled` are backed up but excluded from assessment and review, including
+when they have no recording. This is VoiceInk's own status, not a text-label heuristic.
 
 The first run selects all non-pending history. Later runs select unseen IDs, rather
 than relying solely on timestamps: equal timestamps, delayed commits and pending
@@ -204,8 +207,8 @@ history entry do not cause a second assessment. Missing/unsafe recordings stop t
 batch instead of silently marking them processed. Entries without audio are backed
 up as history, with no assessment. Zero-frame WAVs and confirmed Whisper audio-read
 failures are backed up with their history but skipped for assessment. Their count
-is stored as `unreadable` in the private summary and printed by the hand run and
-`status`, without filenames. Missing or unsafe paths still fail because the job
+is stored as `unreadable` in the private summary and printed by the hand run,
+without filenames. Missing or unsafe paths still fail because the job
 cannot safely back up their audio.
 
 Whisper loads large-v3 once per run and accepts all candidate clips with separate
@@ -214,6 +217,107 @@ are recognized from Whisper's suppressed, in-memory diagnostics. Exit 11 is acce
 only when its failed-input count matches confirmed audio-read failures. Model,
 inference and output failures abort the build instead of silently losing assessments.
 Nothing from Whisper's stdout or stderr is printed or saved.
+
+## VAD, vocabulary and unreliable re-checks
+
+Large-v3 remains the second opinion. Every inference uses whisper.cpp's `--vad` and
+`--vad-model` with the official small Silero v5.1.2 model. Install it once with:
+
+```bash
+/opt/homebrew/bin/python3 "$HOME/Library/Application Support/mac-dictation/bin/recheck.py" download-vad
+```
+
+This downloads to the private `models/` directory from a pinned revision of
+[ggml-org/whisper-vad](https://huggingface.co/ggml-org/whisper-vad/blob/e5614ed76a5dd4b03fad5068c89efcd2617a9d1e/ggml-silero-v5.1.2.bin).
+SHA-256 must be `29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf`.
+The download is verified before installation; existing models are verified without
+re-downloading. A mismatching existing file is left untouched and causes failure.
+The hash is checked again before every weekly assessment and re-assessment.
+
+VAD with no detected speech produces zero output segments and an empty text file;
+these recordings are counted as `excluded_silent`, backed up, and never reviewed.
+Zero-frame WAVs remain classified as `unreadable`. A re-check containing any
+normalized phrase of 1–64 words repeated at least three times consecutively is
+discarded in its entirety, counted as `loops_discarded`, and never ranked. The rule
+uses the same NFKC, case-folding and punctuation normalization as disagreement.
+Two repeats and separated repetitions do not qualify. Intentional triple repetition
+can be discarded too; the count makes this conservative tradeoff visible.
+
+VoiceInk's `VocabularyWord.word` entries are read only from a temporary file copy of
+`dictionary.store` and its available `-wal`/`-shm` sidecars, with integrity checks,
+read-only SQLite access, schema validation and one retry, just like history.
+Only that entity is queried; replacements and preferences are not read. The sorted
+words are joined with comma-space and prefixed with `Important Vocabulary: `,
+matching `CustomVocabularyService.swift` at `c09cc1f`. An empty dictionary adds no
+prompt. This vocabulary string is supplied via Whisper's initial-prompt mechanism
+(`--prompt`), matching the mechanism used by VoiceInk's `LibWhisper.swift`.
+At this upstream revision VoiceInk's local Whisper request resolves a language
+prompt, while its vocabulary formatter is used by enhancement; the re-check uses
+that formatter for the requested vocabulary hint without reading saved prompts.
+The vocabulary is never printed, exported to history, or uploaded. The CLI receives
+it as a process argument, so do not capture process arguments or enable shell tracing.
+Whisper limits the prompt to its model's context capacity.
+
+**Context decision (W1d):** do not pass `--max-context 0`. In whisper.cpp 1.9.5,
+[initial-prompt conditioning requires `n_max_text_ctx > 0`](https://github.com/ggml-org/whisper.cpp/blob/d1be6fde11ac6e0407606b4e42fe72d34add8037/src/whisper.cpp#L7285).
+The [CLI maps `--max-context` to that field](https://github.com/ggml-org/whisper.cpp/blob/d1be6fde11ac6e0407606b4e42fe72d34add8037/examples/cli/cli.cpp#L1237)
+and exposes no independent no-context option. Retain default context to preserve
+the vocabulary hint, as the orchestrator authorized. VAD and loop rejection guard
+against silence/noise and repeated-output failures. These settings do not guarantee
+that large-v3 is more accurate than the inserted text.
+
+## Re-assess the latest copied batch and supersede its old corrections
+
+Close any open review first. From a clean, updated `main` checkout on the Mac:
+
+```bash
+cd "$HOME/Code/mac-dictation"
+git switch main
+git pull --ff-only origin main
+./install-tools.sh
+private_dir="$HOME/Library/Application Support/mac-dictation"
+/opt/homebrew/bin/python3 "$private_dir/bin/recheck.py" download-vad
+/opt/homebrew/bin/python3 "$private_dir/bin/recheck.py" reassess
+/opt/homebrew/bin/python3 "$private_dir/bin/recheck.py" status
+/opt/homebrew/bin/python3 "$private_dir/bin/review.py"
+```
+
+`reassess` reads only the latest run's existing `upload/history/` and
+`upload/recordings/` copies, plus a new dictionary file snapshot. It never opens the
+original recordings or history store, sends nothing to the node, and leaves
+`recheck-state.json` byte-identical. It uses the weekly and review locks and refuses
+an unfinished weekly upload. Model or assessment failure leaves existing reviews
+and submissions unchanged. After a successful assessment it supersedes all existing
+submissions in that run, removes their generated local import files, archives the
+previous review under `superseded-reviews/`, and replaces `review.json` and
+`summary.json`. The normal review command therefore opens the fresh review.
+Re-running re-assessment supersedes any submissions made since the preceding one.
+An interrupted superseding/promotion can be recovered by rerunning `reassess`;
+revocations already written remain authoritative, even if promotion failed.
+
+Superseding writes content-free metadata (submission and run IDs) at
+`supersessions/<submission>.json`, marks the local corrections payload and latest
+`review-result.json` as `superseded`, and blocks retries of revoked submissions.
+There is no automatic learning job in this repository. Any learning integration must
+use `review.active_corrections(run)` and then exclude `skip`/`noise` choices, as
+`proposals` does. Never learn directly from a glob of backed-up correction files.
+The local run is authoritative immediately. On the next **Done**, the fresh
+submission includes a `supersedes` list and additive `supersessions/` files; those
+are copied with the new corrections using the existing additive transfer. Old node
+files remain untouched. A restored node backup must reconcile these revocations
+before use (`active_corrections` also accepts its flat `corrections/` and
+`supersessions/` layout). Until fresh submission copying succeeds, the node's old
+backup alone is not a current learning source. No model, history or recording is
+re-uploaded by this procedure.
+
+`status` prints only five counts: reviewed (`assessed`, eligible completed
+re-checks before ranking), excluded as cancelled, excluded as silent, loops discarded,
+and items flagged (positive disagreements, capped at 20). It prints no IDs, paths,
+text, notes or settings. Unreadable and missing-audio history are not included in
+reviewed; the detailed private summary retains row/recording/unreadable counts.
+
+
+## Snapshot and transfer recovery
 
 Each snapshot copies the database and any WAL/SHM sidecars using plain file I/O.
 SQLite receives only a path in the private temporary folder and opens it read-only.
@@ -251,6 +355,10 @@ Fixtures are constructed from synthetic rows. Tests cover WAL replay, source has
 opens on original paths, corruption retry/skip, schema rejection, pending and tied
 history timestamps, normalization, ranking, confinement, unreadable-audio backup,
 batch model loading, pre-upload cleanup, interrupted promotion and upload retry state.
+W1d fixtures also cover canceled-row backup/exclusion, a silent WAV with mocked
+empty VAD output, loop rejection, vocabulary argument passing and source hashes,
+verified downloads, re-assessment without upload or state changes, noise choices
+and superseded submissions/imports. GPU inference is a Mac validation step.
 The concurrent-writer test compares all three source hashes immediately after the
 writer's deliberate commit with their hashes after the reader returns: the reader
 must add no changes beyond the test writer's own commit.
