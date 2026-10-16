@@ -134,12 +134,28 @@ Reviews, state, staging, the dedicated key and optional count-only logs stay und
 Unreadable and empty recordings retain their additive audio/history backup and are skipped
 for assessment, with only an unreadable count in the private summary and output.
 The profile job slot schedules Sunday at 03:00 local time, subject to the profile jobs permission,
-AC-power and idle checks. The job never changes profiles.
+AC-power and idle checks. The job never changes profiles. It runs installed code,
+never the working checkout. Install and update on the Mac from clean `main`:
+
+```bash
+cd "$HOME/Code/mac-dictation"
+git switch main
+git pull --ff-only origin main
+./install-tools.sh
+```
+
+The installer fetches `origin/main`, refuses dirty or unmerged commits, and copies
+its single code inventory into `$HOME/Library/Application Support/mac-dictation/bin/`
+(0700). `bin/install.json` records the full installed commit. Re-run after updates;
+branch switches do not alter installed code. To replace an existing job command,
+use `homelab-profile job remove` and then `job add`, preserving its calendar as
+shown in the [migration and verification steps](docs/weekly-recheck.md#install-and-update-the-job-code).
+Do not edit the profile slot's state file.
 
 To turn it off (including any already pending scheduled run):
 
 ```bash
-/opt/homebrew/bin/python3 "$HOME/Code/mac-dictation/recheck.py" disable
+/opt/homebrew/bin/python3 "$HOME/Library/Application Support/mac-dictation/bin/recheck.py" disable
 ```
 
 Use `enable` to resume, or `status` to print only enabled state, review existence and counts.
