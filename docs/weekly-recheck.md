@@ -91,31 +91,54 @@ If either destination already exists, stop and establish which installation owns
 it; do not replace a durable model or key. The model move intentionally removes
 the scratch copy. The cleanup GGUF remains in the same durable models directory.
 
-Run once by hand after installing the model and key:
+## Install and update the job code
+
+The weekly job runs an installed copy, never the working checkout. On the Mac,
+install or update from a clean checkout of `main`:
 
 ```bash
-/opt/homebrew/bin/python3 "$HOME/Code/mac-dictation/recheck.py"
-/opt/homebrew/bin/python3 "$HOME/Code/mac-dictation/recheck.py" status
-/opt/homebrew/bin/python3 "$HOME/Code/mac-dictation/verify-node.py"
+cd "$HOME/Code/mac-dictation"
+git switch main
+git pull --ff-only origin main
+./install-tools.sh
+/opt/homebrew/bin/python3 "$HOME/Library/Application Support/mac-dictation/bin/recheck.py" status
 ```
 
-Only share the count-only output. Never show the review or history contents.
-`verify-node.py` uses the dedicated key to upload a synthetic file twice with changed
-content, then checks its hash through administrative SSH to prove zero overwrites.
-It separately tries an SSH command, an rsync read, and a `../` write escape, requiring
-rrsync refusals rather than authentication failures. It reports aggregate WAV/history
-counts using administrative SSH; the write-only job key cannot audit remote files.
-Its `finally` cleanup removes the one known synthetic probe file and its empty
-directory from `originals/`, even if another probe fails. It refuses unexpected
-contents and never recursively removes that directory.
+The installer fetches `origin/main` and refuses tracked, staged or untracked changes,
+or a checkout commit not contained in `origin/main`. A clean ancestor is permitted;
+use the commands above to install the latest main. Git and Python 3 are required.
+The single `files` list in `install-tools.sh` owns the install inventory; extend it
+with the review page and any local imports when that slice merges. Currently
+`recheck.py` uses only standard-library imports. Files are exported from the exact
+commit and installed under `$HOME/Library/Application Support/mac-dictation/bin/`
+(0700), with files and `install.json` (0600). The stamp contains `commit`, the full
+Git commit ID. The installer prints that ID, never private settings or data.
+It replaces only listed code and the stamp; the model, key, state and private
+output remain in their existing locations. Re-run the installer after updates;
+switching branches alone never changes installed code.
 
-Register the schedule only after the hand run and probes pass:
+Do not run the weekly job for installation validation: use `status` only. The
+existing `verify-node.py` probes belong to initial node setup, not this update.
+
+For a **new, unregistered** job, the slot's registration syntax is:
 
 ```bash
-"$HOME/Code/homelab-v2/mac/homelab-profile" job add dictation-recheck \
+"$HOME/Library/Application Support/homelab/mac/homelab-profile" job add dictation-recheck \
   --calendar '{"Weekday":0,"Hour":3,"Minute":0}' \
-  /opt/homebrew/bin/python3 "$HOME/Code/mac-dictation/recheck.py"
+  /opt/homebrew/bin/python3 "$HOME/Library/Application Support/mac-dictation/bin/recheck.py"
 ```
+
+**Existing registration migration is blocked:** the inspected installed
+`homelab-profile` offers `job list`, `job run` and `job add`, but no remove or
+command-update interface; `add` refuses an existing name. The orchestrator must
+obtain a supported migration interface in that repository before re-pointing
+`dictation-recheck`. Do not edit its saved state or import its internal save helpers.
+The target command is the argument array shown above, retaining the exact Sunday
+03:00 calendar. After migration, use `job list`, select only `dictation-recheck`,
+and assert its command and calendar; do not publish the unfiltered list. Run the
+installed `recheck.py status`, switch this checkout to a different branch, and
+repeat the command/calendar assertion. Return to `main` afterward. Never use
+`job run` for these checks.
 
 The profile controller reads `$HOME/.config/homelab/profiles.json`. It permits jobs
 with a per-profile boolean:
@@ -129,44 +152,9 @@ change it.
 The slot waits for AC power and idle time and handles missed runs. Do not switch
 profiles or use the slot's manual run command for validation.
 
-Job commands are argument arrays launched directly, without a shell. Pass the script
-path as `"$HOME/Code/mac-dictation/recheck.py"` so the calling shell expands it. Do
-not pass the literal `~/Code/...`: tilde expansion would not occur inside the saved
-argument. If a job was registered with that literal, this guarded repair changes only
-its command and preserves its schedule; it uses the profile controller's own lock and
-atomic save. No LaunchAgent reload is required because the agent invokes the stable
-`job-worker` entry point, which reads the saved command when the Sunday run starts.
-
-```bash
-/opt/homebrew/bin/python3 - <<'PY'
-from importlib.machinery import SourceFileLoader
-from importlib.util import module_from_spec, spec_from_loader
-from pathlib import Path
-import sys
-
-sys.dont_write_bytecode = True
-profile_path = Path.home() / 'Code/homelab-v2/mac/homelab-profile'
-loader = SourceFileLoader('homelab_profile', str(profile_path))
-spec = spec_from_loader(loader.name, loader)
-profile = module_from_spec(spec)
-sys.modules[spec.name] = profile
-spec.loader.exec_module(profile)
-expected = ['/opt/homebrew/bin/python3', '~/Code/mac-dictation/recheck.py']
-corrected = ['/opt/homebrew/bin/python3',
-             str((Path.home() / 'Code/mac-dictation/recheck.py').resolve())]
-with profile.lock():
-    records = profile.jobs()
-    job = records.get('dictation-recheck')
-    assert job is not None
-    assert job['calendar'] == {'Weekday': 0, 'Hour': 3, 'Minute': 0}
-    if job['command'] == expected:
-        job['command'] = corrected
-        profile.save(profile.STATE / 'jobs.json', records)
-    else:
-        assert job['command'] == corrected
-print('dictation-recheck command is absolute; Sunday 03:00 calendar preserved.')
-PY
-```
+Job commands are argument arrays launched directly, without a shell. Pass the
+installed path with `"$HOME/Library/Application Support/mac-dictation/bin/recheck.py"`
+so the calling shell expands it. Do not save a literal `~` or `$HOME` argument.
 
 ## Private files and recovery
 
@@ -178,6 +166,8 @@ redirected inside this private directory, never into the repository.
 
 | Path | Format and purpose |
 | --- | --- |
+| `bin/` | Installed job code (0700); files 0600 |
+| `bin/install.json` | Public code provenance: full `commit` ID |
 | `recheck-state.json` | Version 1; `last_run` (Unix seconds), `processed_ids`, `latest_run` |
 | `recheck-pending.json` | Durable transaction: run ID, row IDs, time and counts; retained on upload failure |
 | `rechecks/<run-id>/summary.json` | Version 1; counts of rows, recordings, assessed, unreadable and review items |
@@ -258,3 +248,7 @@ batch model loading, pre-upload cleanup, interrupted promotion and upload retry 
 The concurrent-writer test compares all three source hashes immediately after the
 writer's deliberate commit with their hashes after the reader returns: the reader
 must add no changes beyond the test writer's own commit.
+
+Installer tests use disposable Git repositories and synthetic homes. They cover dirty
+tracked/staged/untracked refusals, unmerged commits, fetch failure, ancestor acceptance,
+commit stamps, updates, permissions, symlink refusal and branch independence.
