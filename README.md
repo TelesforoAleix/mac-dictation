@@ -115,6 +115,9 @@ CI runs ShellCheck on every tracked shell script, the no-data-files guard, and G
 
 ## Weekly re-check and node copy
 
+[Local model comparison](docs/model-comparison.md) records the reference and cleanup
+measurements and their limitations.
+
 [Weekly setup and recovery](docs/weekly-recheck.md) covers the Mac commands, repeatable node
 setup, file formats and validation. The job loads its model once per run and re-transcribes new recordings with local Whisper
 large-v3 through Homebrew whisper.cpp (Metal, Auto). It compares inserted sentences (cleaned text when available)
