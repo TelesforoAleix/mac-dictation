@@ -2,7 +2,7 @@
 
 Private dictation on a Mac: speech-to-text and text cleanup run on the Mac, not in the cloud.
 
-**Status:** built and tested on my Mac. The build, the settings script, the local cleanup server,
+**Status:** in use on my Mac. The build, the settings script, the local cleanup server,
 the weekly re-check and the review page exist and are tested. The build is validated with
 VoiceInk 2.21 on macOS 27.
 
