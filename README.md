@@ -1,8 +1,79 @@
 # mac-dictation
 
+Private dictation on a Mac: speech-to-text and text cleanup run on the Mac, not in the cloud.
+
+**Status:** in use on my Mac. The build, the settings script, the local cleanup server,
+the weekly re-check and the review page exist and are tested. The build is validated with
+VoiceInk 2.21 on macOS 27.
+
+## Why it exists
+
+I dictate a lot on my Mac, in several languages and in many apps. I wanted the speech, the
+transcripts and the cleanup to stay on my own machine.
+
+## What it does
+
+The scripts build unmodified upstream [VoiceInk](https://github.com/Beingpax/VoiceInk) at a
+chosen commit, with no fork or patch. Then they apply my dictation settings:
+
+- Speech-to-text with local Whisper large-v3-turbo, language Auto.
+- Fn (🌐) as the dictation shortcut.
+- A local cleanup model, Qwen3 4B through llama.cpp on the Mac, that tidies the text before it
+  appears at the cursor.
+
+Nothing leaves the Mac for dictation. Model downloads are the only external model traffic.
+
+The setup also improves from its own use. Every week, a job re-transcribes new recordings with a
+larger local model, Whisper large-v3. It keeps up to 10 sentences where the two transcripts
+disagree. A local review page lets me listen to each one and settle it. My corrections become a
+dictionary file that I import into VoiceInk after a preview. The job also copies recordings and
+history to the encrypted weekly backup on my home server, part of my
+[Home Lab](https://github.com/TelesforoAleix/homelab-v2).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/dictation-flow-dark.svg">
+  <img alt="Process diagram in three lanes. I press Fn and speak; on the Mac, Whisper transcribes locally, the local cleanup model tidies the text, and the text appears at the cursor. Every week, a job re-transcribes new recordings with a larger model and compares the sentences; if they disagree, I listen and settle each one on a review page, and the job copies recordings and history to the encrypted backup." src="docs/diagrams/dictation-flow-light.svg" width="100%">
+</picture>
+
+## How it is built
+
+- `build.sh` clones VoiceInk at a fixed commit, refuses changed upstream source, runs upstream's
+  own `make local`, and installs the app.
+- `settings.sh` backs up VoiceInk's preferences, writes the decided settings, and reads them back
+  to verify them.
+- `cleanup-server.sh` runs the cleanup model with llama.cpp's `llama-server` as a macOS launch
+  agent. It listens on `127.0.0.1` only.
+- `recheck.py` is the weekly job. It reads a snapshot copy of VoiceInk's history, re-transcribes
+  with whisper.cpp, compares sentences, and copies new files to the backup.
+- `review.py`, with a plain HTML, CSS and JavaScript page, is the local review page. It plays only
+  the part of the recording around each sentence.
+- `check-no-data.sh` and CI (ShellCheck, the no-data guard and Gitleaks) keep private data out of
+  the repository.
+
+## What I designed and decided
+
+- **Build upstream, do not fork.** VoiceInk stays unmodified. An update is a new commit hash and a
+  rebuild, with no patch to maintain.
+- **Settings by script, with a backup first.** The script exports the current preferences before
+  it writes, verifies every value, and reports `No change` on a second run.
+- **Code only in the repository.** Recordings, transcripts, vocabulary and settings never enter
+  the repository. A no-data guard runs in CI and before every commit.
+- **Everything local.** Before building, I measured three options: local on the Mac, on the home
+  server, or a hybrid. Local on the Mac won. I then compared local speech and cleanup models; the
+  results are in [Local model comparison](docs/model-comparison.md).
+- **A person settles every change.** The weekly loop only proposes. Nothing changes VoiceInk until
+  I import the file and accept VoiceInk's preview.
+
+## Where it is going
+
+Planned: a weekly analysis with a local model of about 27B parameters will propose cleanup and
+vocabulary changes. A proposed change will apply only if a replay test shows that it is better.
+
+## For agents and operators
+
 Scripts build unmodified upstream [VoiceInk](https://github.com/Beingpax/VoiceInk) at a chosen commit and apply local dictation settings. There is no fork, patch, or dependency pin. This repository holds code only; VoiceInk keeps recordings, transcripts, settings, models, vocabulary, and replacements on the Mac. These scripts are MIT licensed; VoiceInk is GPLv3.
 
-## Prerequisites
+### Prerequisites
 
 Use macOS 27 or later and full Xcode 27.0 or later, with its licence accepted and `xcode-select -p` pointing to the Xcode developer directory. Git and network access are needed to fetch upstream and its build dependencies. ShellCheck is needed to validate repository changes (`brew install shellcheck` if missing).
 
@@ -19,7 +90,7 @@ The first status command must succeed and the component report must say `Status:
 
 The settings script uses the system Swift interpreter supplied by Xcode. Whisper large-v3-turbo must already be downloaded in VoiceInk; neither script downloads speech models.
 
-## Install and configure
+### Install and configure
 
 Run in a normal terminal outside a restricted sandbox, from this repository:
 
@@ -45,7 +116,7 @@ Run in a normal terminal outside a restricted sandbox, from this repository:
 
 The encoded mode and shortcut formats are taken from the default upstream commit. Other mode fields and unrelated preferences are preserved. Model and language choices in other modes are preserved, so per-app modes can override the default. The script reads only keys needed for comparison and never prints encoded settings or private content. It writes through `defaults`, verifies readback, and relaunches VoiceInk. A second run with matching settings reports `No change` and creates no new backup. `--verify` checks settings without quitting the app or writing preferences, and reports only key names and pass/mismatch status.
 
-## Local cleanup server and one-time provider step
+### Local cleanup server and one-time provider step
 
 The server requires `/opt/homebrew/bin/llama-server` (validated configuration: 0.6.0) and runs on `127.0.0.1:8095` only. Ports 8091 and 8092 are untouched. Before installing, stop the manually launched cleanup server; the installer refuses an occupied port when its own agent is not loaded. The orchestrator uses `pkill -x llama-server` for the known manual process.
 
@@ -76,7 +147,7 @@ To return to D1's cleanup behaviour:
 
 This disables enhancement in all modes and Auto Learn, unloads the agent, and removes its generated plist. The model, logs, UI-created provider, Keychain and custom prompts are retained. The transcription model, language, Fn shortcut and recording retention stay as in D1. Both recording-deletion keys remain false in either configuration.
 
-## Permissions and manual steps
+### Permissions and manual steps
 
 Launch `/Applications/VoiceInk.app` and grant Microphone and Accessibility to that app in System Settings → Privacy & Security. Remove stale entries for the old Downloads copy if shown. An ad hoc rebuild may require these permissions again. **After granting permissions, quit and reopen VoiceInk**, including after a rebuild that asks for permissions again. If VoiceInk was launched before Accessibility was granted, Fn may do nothing until the app is reopened: upstream creates its shortcut event tap at launch and does not retry it. Finish or skip onboarding without enabling a cloud provider or Screen Recording, and rerun `settings.sh` if onboarding changes a decided setting.
 
@@ -88,7 +159,7 @@ Hybrid Fn uses a short press to start and another to stop; holding Fn for more t
 
 **Vocabulary and replacements are kept by VoiceInk on the Mac — export them from VoiceInk after editing.** Keep those exports outside this repository.
 
-## Update and restore
+### Update and restore
 
 To update, pass an upstream commit hash, rebuild, and reapply settings:
 
@@ -101,7 +172,7 @@ The settings schema is verified at the default commit; inspect a newer commit's 
 
 To restore preferences, quit VoiceInk, run the exact `defaults import com.prakashjoshipax.VoiceInk` command printed by `settings.sh` with its backup filename, and reopen `/Applications/VoiceInk.app`. Backups contain private preferences: keep them outside version control. The domain backup does not restore macOS's Fn action or login registration; restore those in System Settings and VoiceInk if desired. The weekly re-check reads a temporary snapshot of the history store and reads recordings; it never writes to VoiceInk's files. Other scripts leave the stores, recordings, model directory and Keychain untouched.
 
-## Repository checks
+### Repository checks
 
 Before every commit:
 
@@ -113,7 +184,7 @@ bash check-no-data.sh
 
 CI runs ShellCheck on every tracked shell script, the no-data-files guard, and Gitleaks with full Git history. The guard rejects tracked audio, JSON/JSONL, private keys, Python bytecode, CSV, plist, store/SQLite, and model files, and any file larger than 256 KiB. It checks tracked files only; ignore rules also keep the upstream clone and build output out of Git. These guards cannot identify all personal content in otherwise allowed text files: review every staged diff. GitHub secret scanning and push protection are enabled. Protected `main` requires the strict `check` job, including for administrators, and disallows force pushes and deletions.
 
-## Weekly re-check and node copy
+### Weekly re-check and node copy
 
 [Local model comparison](docs/model-comparison.md) records the reference and cleanup
 measurements and their limitations.
@@ -166,7 +237,7 @@ Disabling does not remove recordings, reviews, backups, the model, or the key. A
 in progress is allowed to finish.
 
 
-## Five-minute weekly review
+### Five-minute weekly review
 
 When a weekly run finishes with items, **Weekly Dictation Review** posts a count-only
 notification. Install/update the tools from merged `main` using `./install-tools.sh` as above.
